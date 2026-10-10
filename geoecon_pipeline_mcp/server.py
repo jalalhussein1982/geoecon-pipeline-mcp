@@ -47,6 +47,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.subscriptions import InMemorySubscriptionBus
 from mcp.types import ToolAnnotations
 
+from . import cost as C
+from . import health as H
 from . import models as M
 from .store import LLM_STAGES, Store, SyntheticStore
 from .synth import FIXTURES_DIR, SOURCES_PATH
@@ -86,6 +88,8 @@ class Settings:
     sources_path: Path = SOURCES_PATH
     pricing_path: Path = ROOT / "pricing.yaml"
     default_budget_usd: float = 2.00
+    gate_model: str = "deepseek-v3.2"
+    synthesis_model: str = "deepseek-v3.2"
     allow_send: bool = False
     stdio_scopes: tuple[str, ...] = (SCOPE_READ, SCOPE_OPERATE)
     fake_unit_sleep: float = 0.05
@@ -112,6 +116,8 @@ class Settings:
             sources_path=Path(sources) if sources else SOURCES_PATH,
             pricing_path=Path(e.get("PRICING_PATH") or ROOT / "pricing.yaml"),
             default_budget_usd=float(e.get("DEFAULT_BUDGET_USD", "2.00")),
+            gate_model=e.get("GATE_MODEL", "deepseek-v3.2"),
+            synthesis_model=e.get("SYNTHESIS_MODEL", "deepseek-v3.2"),
             allow_send=_bool(e.get("ALLOW_SEND")),
             stdio_scopes=tuple(s.strip() for s in e.get("STDIO_SCOPES", f"{SCOPE_READ},{SCOPE_OPERATE}").split(",") if s.strip()),
             fake_unit_sleep=float(e.get("FAKE_UNIT_SLEEP", "0.05")),
@@ -138,6 +144,9 @@ class App:
         )
         self._sources_cache: list | None = None
         self._tmp_db: Path | None = None
+        self.pricing = C.Pricing.load(settings.pricing_path)
+        self.stage_models = {"gate": settings.gate_model, "cluster": settings.gate_model,
+                             "synthesis": settings.synthesis_model, "summary": settings.synthesis_model}
 
     # -- registry --------------------------------------------------------------------
 
@@ -357,7 +366,7 @@ def register_tools(app: App) -> None:
         `ok=false` carries the watchdog's own subject and body; a stale run (still `running`
         six hours after it started) means a process died without unwinding."""
         app.require(SCOPE_READ)
-        raise ToolError("not implemented")
+        return M.HealthVerdict(**H.verdict(store))
 
     @mcp.tool(title="LLM cost report for a run", annotations=READ_ONLY)
     def cost_report(run_id: Annotated[int, Field(description="Run id from list_runs.")]) -> M.CostReport:
@@ -365,7 +374,7 @@ def register_tools(app: App) -> None:
         pricing.yaml. `partial=true` when some completed stage has no usage because it ran
         outside the server (the CronJob keeps no token ledger)."""
         app.require(SCOPE_READ)
-        raise ToolError("not implemented")
+        return M.CostReport(**C.cost_report(store, app.run(run_id), app.pricing))
 
     @mcp.tool(title="Start a job (resume a run or run one stage)",
               annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,

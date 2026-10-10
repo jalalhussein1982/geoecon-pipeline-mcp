@@ -1,0 +1,27 @@
+# LLM pricing used by cost_report, preview_resume and the budget gate.
+#
+# USD per 1M tokens, per model as named in the pipeline's GATE_MODEL / SYNTHESIS_MODEL /
+# DEDUP_MODEL settings. The pipeline itself keeps no price list, so this file is the ledger's
+# only source of prices. THE VALUES BELOW ARE PLACEHOLDERS set at design time; the repo owner
+# sets the real rates for the e-INFRA gateway and bumps `as_of`. The server reports `as_of`
+# in every cost figure so a stale table is visible.
+as_of: "2026-10-11"
+note: "placeholder rates; owner to set real per-model prices and update as_of"
+models:
+  deepseek-v3.2:
+    input_per_m: 0.27
+    output_per_m: 1.10
+  kimi-k2.6:
+    input_per_m: 0.60
+    output_per_m: 2.50
+  gemma4:
+    input_per_m: 0.10
+    output_per_m: 0.30
+  default:
+    input_per_m: 0.50
+    output_per_m: 2.00
+# Model-group names the gateway accepts that map onto a priced model.
+aliases:
+  deepseek: deepseek-v3.2
+  deepseek-v4-pro: deepseek-v3.2
+  kimi: kimi-k2.6
