@@ -5,13 +5,18 @@ so it has no cost ledger. This module gives the server one: `Pricing` prices tok
 `estimate` predicts a stage's tokens from the rows it will touch (spec §4.3), and
 `cost_report` sums what the server's jobs actually spent (`mcp_jobs.usage`).
 
-The counting proxy that fills `usage` (`CountingLLMClient`) and the budget gate live here
-too; they are added by the cost-gate task.
+`CountingLLMClient` wraps the pipeline's `LLMClient` (same `complete(model, messages, **p)`
+signature, so stage code cannot tell the difference), adds every response's token counts
+to the job's usage, and enforces the budget between calls: when spend passes the ceiling it
+calls back into the runner, which parks the job in `input_required` until the operator
+answers. Cancel is checked at the same boundary.
 """
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +93,74 @@ class Pricing:
     def usd(self, model: str, tokens_in: int, tokens_out: int) -> float:
         r = self.rate(model)
         return round(tokens_in / 1e6 * r.input_per_m + tokens_out / 1e6 * r.output_per_m, 6)
+
+
+# ── counting proxy and budget ───────────────────────────────────────────────────────
+
+
+@dataclass
+class Budget:
+    limit_usd: float
+    spent_usd: float = 0.0
+
+    @property
+    def exceeded(self) -> bool:
+        return self.spent_usd > self.limit_usd
+
+
+class CountingLLMClient:
+    """Drop-in for `geoecon.llm.client.LLMClient.complete`. Thread-safe: gate and synthesis fan
+    LLM calls out to worker threads, so the ledger is lock-guarded."""
+
+    def __init__(self, inner: Any, pricing: Pricing, budget: Budget, usage: dict[str, Any], *,
+                 on_exceeded: Callable[[float], None] | None = None, cancel: threading.Event | None = None,
+                 on_usage: Callable[[], None] | None = None):
+        self.inner = inner
+        self.pricing = pricing
+        self.budget = budget
+        self.usage = usage
+        self.on_exceeded = on_exceeded
+        self.cancel = cancel
+        self.on_usage = on_usage
+        self.stage = "unknown"
+        self.calls = 0
+        self._lock = threading.Lock()
+        self._gate_lock = threading.Lock()
+
+    def set_stage(self, stage: str) -> None:
+        self.stage = stage
+
+    def __getattr__(self, name: str) -> Any:          # everything else passes through (base_url, session, ...)
+        return getattr(self.inner, name)
+
+    def complete(self, model: str, messages: list[dict], **params: Any) -> Any:
+        self._before_call()
+        resp = self.inner.complete(model, messages, **params)
+        self._record(model, resp)
+        return resp
+
+    def _before_call(self) -> None:
+        """Cooperation point: cancel wins; then the budget ceiling. Serialised so that four
+        workers do not ask the operator four times."""
+        with self._gate_lock:
+            if self.cancel is not None and self.cancel.is_set():
+                from .jobs import JobCancelled
+                raise JobCancelled("cancelled via MCP")
+            if self.budget.exceeded and self.on_exceeded is not None:
+                self.on_exceeded(self.budget.spent_usd)   # blocks until answered; raises to abort
+
+    def _record(self, model: str, resp: Any) -> None:
+        pt = getattr(resp, "prompt_tokens", None) or 0
+        ct = getattr(resp, "completion_tokens", None) or 0
+        with self._lock:
+            self.calls += 1
+            call_usd = add_usage(self.usage, self.stage, model, pt, ct, self.pricing)
+            self.budget.spent_usd = round(self.budget.spent_usd + call_usd, 6)
+        if self.on_usage is not None:
+            try:
+                self.on_usage()
+            except Exception:  # noqa: BLE001 — persisting usage is best-effort per call
+                pass
 
 
 # ── estimator ───────────────────────────────────────────────────────────────────────

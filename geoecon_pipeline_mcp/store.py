@@ -63,6 +63,7 @@ class Store(Protocol):
     def set_run_status(self, run_id: int, status: str) -> None: ...
     def merge_run_metrics(self, run_id: int, metrics: dict) -> None: ...
     def append_run_note(self, run_id: int, note: str) -> None: ...
+    def mark_run_failed(self, run_id: int, note: str) -> None: ...
     # jobs
     def job_insert(self, job: dict) -> None: ...
     def job_get(self, job_id: str) -> dict | None: ...
@@ -291,7 +292,8 @@ class SyntheticStore:
             "status": r["status"], "started_at": parse_dt(r["started_at"]),
             "finished_at": parse_dt(r["finished_at"]), "synthesis_model": r["synthesis_model"],
             "stages": stages, "metrics": _j(r["metrics"], {}), "notes": r["notes"],
-            "next_stage": next_stage_of(stages),
+            # a completed run has nothing next even if it predates a stage (older runs lack discovery_registry)
+            "next_stage": None if r["status"] == "completed" else next_stage_of(stages),
             "completed_stages": [s["stage_name"] for s in stages if s["status"] == "completed"],
         }
 
@@ -429,6 +431,15 @@ class SyntheticStore:
     def append_run_note(self, run_id: int, note: str) -> None:
         self._x("UPDATE runs SET notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || ' | ' || ? END "
                 "WHERE run_id=?", (note, note, run_id))
+
+    def mark_run_failed(self, run_id: int, note: str) -> None:
+        """Close out an abandoned run (mirrors Repo.mark_run_failed)."""
+        now = iso(datetime.now(timezone.utc))
+        self._x("UPDATE runs SET status='failed', finished_at=COALESCE(finished_at, ?), "
+                "notes=CASE WHEN notes IS NULL OR notes='' THEN ? ELSE notes || ' | ' || ? END WHERE run_id=?",
+                (now, note, note, run_id))
+        self._x("UPDATE stage_runs SET status='failed', finished_at=COALESCE(finished_at, ?), error=COALESCE(error, ?) "
+                "WHERE run_id=? AND status='running'", (now, note, run_id))
 
     # -- jobs -------------------------------------------------------------------------
 

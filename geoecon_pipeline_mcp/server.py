@@ -29,10 +29,12 @@ Design choices, stated once here and once in the README:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -44,14 +46,15 @@ from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.subscriptions import InMemorySubscriptionBus
+from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 from mcp.types import ToolAnnotations
 
 from . import cost as C
 from . import health as H
 from . import models as M
-from .store import LLM_STAGES, Store, SyntheticStore
-from .synth import FIXTURES_DIR, SOURCES_PATH
+from .jobs import TERMINAL, JobConflict, JobRegistry, NotWaiting, UnknownJob
+from .store import CANONICAL_STAGES, LLM_STAGES, Store, SyntheticStore, expected_stages
+from .synth import FIXTURES_DIR, SOURCES_PATH, FakeLLM, make_fake_stages
 
 log = logging.getLogger("geoecon_pipeline_mcp.server")
 
@@ -135,7 +138,8 @@ class Settings:
 class App:
     """Everything the tool functions close over. One per server process (or per test)."""
 
-    def __init__(self, settings: Settings, store: Store):
+    def __init__(self, settings: Settings, store: Store, stage_factory: Callable | None = None,
+                 llm_factory: Callable[[], Any] | None = None):
         self.settings = settings
         self.store = store
         self.bus = InMemorySubscriptionBus()
@@ -147,6 +151,41 @@ class App:
         self.pricing = C.Pricing.load(settings.pricing_path)
         self.stage_models = {"gate": settings.gate_model, "cluster": settings.gate_model,
                              "synthesis": settings.synthesis_model, "summary": settings.synthesis_model}
+        self.loop: asyncio.AbstractEventLoop | None = None
+        if stage_factory is None or llm_factory is None:
+            if settings.mode == "synthetic":
+                sf = stage_factory or (lambda client: make_fake_stages(store, client, unit_sleep=settings.fake_unit_sleep))
+                lf = llm_factory or (lambda: FakeLLM(settings.fake_prompt_tokens, settings.fake_completion_tokens))
+            else:
+                from .pg import pipeline_factories
+                psf, plf = pipeline_factories(settings, store)
+                sf, lf = stage_factory or psf, llm_factory or plf
+        else:
+            sf, lf = stage_factory, llm_factory
+        self.registry = JobRegistry(
+            store, sf, pricing=self.pricing, stage_models=self.stage_models, llm_factory=lf,
+            notify=self.notify, default_budget_usd=settings.default_budget_usd,
+            db_progress=(settings.mode == "postgres"),
+        )
+
+    # -- notifications -----------------------------------------------------------------
+
+    def notify(self, uri: str) -> None:
+        """Publish a resource-updated event from any thread. Scheduled onto the server's event
+        loop, which the operation tools capture when they run."""
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.bus.publish(ResourceUpdated(uri=uri)), loop)
+        except RuntimeError:
+            pass
+
+    def capture_loop(self) -> None:
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
 
     # -- registry --------------------------------------------------------------------
 
@@ -184,6 +223,7 @@ class App:
         return d
 
     def close(self) -> None:
+        self.registry.shutdown()
         close = getattr(self.store, "close", None)
         if close:
             close()
@@ -215,12 +255,13 @@ def _open_store(settings: Settings, app_ref: list) -> Store:
     return PostgresStore.connect(settings.db_dsn)
 
 
-def create_server(settings: Settings | None = None, store: Store | None = None) -> App:
+def create_server(settings: Settings | None = None, store: Store | None = None,
+                  stage_factory: Callable | None = None, llm_factory: Callable[[], Any] | None = None) -> App:
     settings = settings or Settings.from_env()
     tmp_ref: list = []
     if store is None:
         store = _open_store(settings, tmp_ref)
-    app = App(settings, store)
+    app = App(settings, store, stage_factory, llm_factory)
     app._tmp_db = tmp_ref[0] if tmp_ref else None
     register_tools(app)
     return app
@@ -379,7 +420,8 @@ def register_tools(app: App) -> None:
     @mcp.tool(title="Start a job (resume a run or run one stage)",
               annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
                                           open_world_hint=True))
-    def start_job(
+    async def start_job(
+        ctx: Context,
         kind: Annotated[Literal["resume_run", "run_stage", "reconcile_abandoned"], Field(description="What to do.")],
         run_id: Annotated[int | None, Field(description="Run to act on (resume_run, run_stage).")] = None,
         stage: Annotated[str | None, Field(description="Stage name for run_stage.")] = None,
@@ -391,7 +433,29 @@ def register_tools(app: App) -> None:
         Poll job_status(job_id) or listen on job://{job_id}. Refuses when the run does not exist,
         the stage is not next (without force), or another job is active on the run."""
         app.require(SCOPE_OPERATE)
-        raise ToolError("not implemented")
+        app.capture_loop()
+        trace = _trace_from(ctx)
+        note = None
+        if kind == "reconcile_abandoned":
+            stages: list[str] = []
+            run_id = None
+        else:
+            if run_id is None:
+                raise ToolError(f"{kind} needs run_id. Call list_runs to pick one.")
+            d = app.run(run_id)
+            if kind == "run_stage":
+                stages = [_validate_stage(app, d, stage, force)]
+            else:
+                stages, note = _plan_for_resume(app, d)
+                if not stages:
+                    raise ToolError(f"Run {run_id} has nothing to resume: every stage is completed "
+                                    f"(status={d['status']}). Use run_stage with force=true to re-run one stage.")
+        try:
+            job = app.registry.start(kind, run_id, stages, budget_usd, app.principal(), trace, note=note)
+        except JobConflict as e:
+            raise ToolError(str(e))
+        return M.JobHandle(job_id=job["job_id"], status=job["status"], poll_after_s=app.registry.poll_after_s,
+                           stages_planned=stages, run_id=run_id, note=note)
 
     @mcp.tool(title="Job status", annotations=READ_ONLY)
     def job_status(job_id: Annotated[str, Field(description="Job id from start_job.")]) -> M.Job:
@@ -399,7 +463,7 @@ def register_tools(app: App) -> None:
         stage and progress, usage so far, the budget question when input is required, and the
         result or error when terminal."""
         app.require(SCOPE_READ)
-        raise ToolError("not implemented")
+        return _job_model(app, _job(app, job_id))
 
     @mcp.tool(title="Answer a job's budget question",
               annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
@@ -421,7 +485,15 @@ def register_tools(app: App) -> None:
         """Cooperative cancel: the runner stops between stages and between LLM batches; the
         running batch finishes; the stage is marked failed with error='cancelled via MCP'."""
         app.require(SCOPE_OPERATE)
-        raise ToolError("not implemented")
+        app.capture_loop()
+        before = _job(app, job_id)
+        if before["status"] in TERMINAL:
+            return M.Cancelled(job_id=job_id, status=before["status"],
+                               message=f"job already {before['status']}; nothing to cancel")
+        row = app.registry.cancel(job_id)
+        return M.Cancelled(job_id=job_id, status=row["status"],
+                           message="cancel requested; the runner stops at the next stage or LLM-batch boundary"
+                           if row["status"] not in TERMINAL else f"job {row['status']}")
 
     @mcp.tool(title="Preview a resume (dry run)", annotations=READ_ONLY)
     async def preview_resume(ctx: Context, run_id: Annotated[int, Field(description="Run id from list_runs.")]) -> M.ResumePreview:
@@ -433,10 +505,84 @@ def register_tools(app: App) -> None:
 
 
 def _active_job_id(app: App, run_id: int) -> str | None:
-    for j in app.store.jobs_for_run(run_id):
-        if j["status"] in ("working", "input_required"):
-            return j["job_id"]
-    return None
+    return app.registry.active_for_run(run_id)
+
+
+def _job(app: App, job_id: str) -> dict:
+    try:
+        return app.registry.get(job_id)
+    except UnknownJob as e:
+        raise ToolError(str(e))
+
+
+def _job_model(app: App, row: dict) -> M.Job:
+    terminal = row["status"] in TERMINAL
+    ttl = None
+    if terminal and row.get("ttl_expires_at"):
+        ttl = max(0, int((row["ttl_expires_at"] - datetime.now(row["ttl_expires_at"].tzinfo)).total_seconds()))
+    result = row.get("result") or None
+    return M.Job(
+        job_id=row["job_id"], kind=row["kind"], run_id=row["run_id"], status=row["status"], stage=row.get("stage"),
+        stages_planned=row.get("stages_planned") or [],
+        stages_completed=[k for k in (result or {}) if k in CANONICAL_STAGES],
+        progress=M.Progress(**row["progress"]) if row.get("progress") else None,
+        poll_after_s=0.0 if terminal else app.registry.poll_after_s, ttl_s=ttl,
+        started_at=row["created_at"], updated_at=row["updated_at"], finished_at=row.get("finished_at"),
+        budget_usd=float(row.get("budget_usd") or 0.0), usage=row.get("usage") or {},
+        input_request=M.InputRequest(**row["input_request"]) if row.get("input_request") else None,
+        result=result, error=row.get("error"), principal=row.get("principal"), trace=row.get("trace") or {},
+    )
+
+
+def _trace_from(ctx: Context) -> dict[str, Any]:
+    """traceparent / tracestate / baggage from the request's _meta, if the host sent them."""
+    try:
+        meta = ctx.request_context.meta or {}
+    except Exception:  # noqa: BLE001 — no request context (direct call)
+        return {}
+    return {k: meta[k] for k in ("traceparent", "tracestate", "baggage") if k in meta}
+
+
+def _validate_stage(app: App, d: dict, stage: str | None, force: bool) -> str:
+    if not stage:
+        raise ToolError(f"run_stage needs `stage`; the next stage of run {d['run_id']} is {d['next_stage']!r}.")
+    known = set(CANONICAL_STAGES)
+    if stage not in known:
+        raise ToolError(f"Unknown stage {stage!r}. Stages are: {', '.join(CANONICAL_STAGES)}.")
+    if stage != d["next_stage"] and not force:
+        raise ToolError(f"Stage {stage!r} is not the next stage of run {d['run_id']} (next is {d['next_stage']!r}). "
+                        "Pass force=true to run it anyway.")
+    if stage == "send":
+        _send_guard(app)
+    return stage
+
+
+def _send_guard(app: App) -> None:
+    if not app.settings.allow_send:
+        raise ToolError("The send stage is disabled on this server (ALLOW_SEND is not 1). Nobody mails the "
+                        "newsletter from a chat by accident; the CronJob sends.")
+    if SCOPE_SEND not in app.scopes():
+        raise ToolError(f"The send stage requires the {SCOPE_SEND} scope; the current credentials carry "
+                        f"{sorted(app.scopes())}.")
+
+
+def _plan_for_resume(app: App, d: dict) -> tuple[list[str], str | None]:
+    """Stages after the last completed one, in order; `send` only when the guard passes."""
+    nxt = d["next_stage"]
+    if nxt is None:
+        return [], None
+    order = expected_stages(d["stages"])
+    remaining = [s for s in order[order.index(nxt):] if s not in d["completed_stages"]]
+    note = None
+    if "send" in remaining and not _send_allowed(app):
+        remaining.remove("send")
+        note = ("send withheld: the run will stop after render (ALLOW_SEND unset or pipeline:send missing); "
+                "run_status will say so")
+    return remaining, note
+
+
+def _send_allowed(app: App) -> bool:
+    return bool(app.settings.allow_send) and SCOPE_SEND in app.scopes()
 
 
 async def _progress(ctx: Context, done: int, total: int, message: str) -> None:
