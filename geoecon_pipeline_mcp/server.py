@@ -45,6 +45,7 @@ from pydantic import Field
 
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
@@ -179,10 +180,12 @@ class App:
         self.settings = settings
         self.store = store
         self.bus = InMemorySubscriptionBus()
+        verifier, auth = _auth_from(settings)
         self.mcp: MCPServer = MCPServer(
             "geoecon-pipeline", instructions=INSTRUCTIONS, subscriptions=self.bus,
             cache_hints={"resources/read": CacheHint(ttl_ms=0, scope="private")},
             middleware=[ResourceCacheMiddleware()],
+            token_verifier=verifier, auth=auth,
         )
         self._sources_cache: list | None = None
         self._tmp_db: Path | None = None
@@ -269,6 +272,21 @@ class App:
             for p in (self._tmp_db, Path(str(self._tmp_db) + "-wal"), Path(str(self._tmp_db) + "-shm")):
                 if p.exists():
                     p.unlink()
+
+
+def _auth_from(settings: Settings):
+    """OAuth resource-server wiring when an issuer and a resource URL are configured (HTTP mode).
+    Over stdio nothing is configured and STDIO_SCOPES apply."""
+    if not (settings.auth_issuer and settings.auth_resource_url):
+        return None, None
+    from .auth import JwtVerifier
+
+    verifier = JwtVerifier(issuer=settings.auth_issuer, audience=settings.auth_resource_url,
+                           hs256_secret=settings.auth_hs256_secret, public_key_pem=settings.auth_public_key_pem,
+                           jwks_url=settings.auth_jwks_url)
+    auth = AuthSettings(issuer_url=settings.auth_issuer, resource_server_url=settings.auth_resource_url,
+                        required_scopes=[SCOPE_READ], validate_token_resource=True)
+    return verifier, auth
 
 
 def _open_store(settings: Settings, app_ref: list) -> Store:
