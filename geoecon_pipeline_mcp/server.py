@@ -53,7 +53,8 @@ from . import cost as C
 from . import health as H
 from . import models as M
 from .jobs import TERMINAL, JobConflict, JobRegistry, NotWaiting, UnknownJob
-from .store import CANONICAL_STAGES, LLM_STAGES, Store, SyntheticStore, expected_stages
+from .stages import plan_resume
+from .store import CANONICAL_STAGES, LLM_STAGES, Store, SyntheticStore
 from .synth import FIXTURES_DIR, SOURCES_PATH, FakeLLM, make_fake_stages
 
 log = logging.getLogger("geoecon_pipeline_mcp.server")
@@ -501,7 +502,32 @@ def register_tools(app: App) -> None:
         window they receive, whether `send` is withheld, and the LLM cost estimate per stage
         against the default budget."""
         app.require(SCOPE_READ)
-        raise ToolError("not implemented")
+        d = app.run(run_id)
+        plan = plan_resume(d, allow_send=_send_allowed(app))
+        estimates = []
+        llm = [s for s in plan.remaining if s in LLM_STAGES]
+        for i, st in enumerate(llm, 1):
+            estimates.append(M.Estimate(**app.registry.estimate(st, d)))
+            await _progress(ctx, i, len(llm), f"estimated {st}")
+        total = round(sum(e.usd for e in estimates), 6)
+        budget = app.settings.default_budget_usd
+        first_over = next((e for e in estimates if e.usd > budget), None)
+        if plan.nothing_to_resume:
+            msg = f"Run {run_id} has nothing to resume: every stage is completed (status={d['status']})."
+        else:
+            msg = (f"start_job(resume_run, {run_id}) would run {', '.join(plan.remaining)} with the original window "
+                   f"{plan.window_start:%Y-%m-%d %H:%M}Z -> {plan.window_end:%Y-%m-%d %H:%M}Z; estimated "
+                   f"{total:.4f} USD against a default budget of {budget:.2f} USD")
+            if first_over:
+                msg += f"; stage {first_over.stage} alone ({first_over.usd:.4f} USD) exceeds it, so the job would pause for approval"
+            if plan.send_withheld:
+                msg += "; send is withheld (ALLOW_SEND unset or pipeline:send missing), the run will stop after render"
+            msg += "."
+        return M.ResumePreview(
+            run_id=run_id, window_start=plan.window_start, window_end=plan.window_end, remaining=plan.remaining,
+            skipped_completed=plan.skipped_completed, send_withheld=plan.send_withheld, estimates=estimates,
+            estimated_usd=total, default_budget_usd=budget, would_require_approval=first_over is not None, message=msg,
+        )
 
 
 def _active_job_id(app: App, run_id: int) -> str | None:
@@ -568,17 +594,12 @@ def _send_guard(app: App) -> None:
 
 def _plan_for_resume(app: App, d: dict) -> tuple[list[str], str | None]:
     """Stages after the last completed one, in order; `send` only when the guard passes."""
-    nxt = d["next_stage"]
-    if nxt is None:
-        return [], None
-    order = expected_stages(d["stages"])
-    remaining = [s for s in order[order.index(nxt):] if s not in d["completed_stages"]]
+    plan = plan_resume(d, allow_send=_send_allowed(app))
     note = None
-    if "send" in remaining and not _send_allowed(app):
-        remaining.remove("send")
+    if plan.send_withheld:
         note = ("send withheld: the run will stop after render (ALLOW_SEND unset or pipeline:send missing); "
                 "run_status will say so")
-    return remaining, note
+    return plan.remaining, note
 
 
 def _send_allowed(app: App) -> bool:
