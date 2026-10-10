@@ -6,3 +6,4 @@ __pycache__/
 *.db-journal
 dist/
 .DS_Store
+/.synthetic-*.db
