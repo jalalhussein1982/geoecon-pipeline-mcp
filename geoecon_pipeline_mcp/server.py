@@ -30,6 +30,7 @@ Design choices, stated once here and once in the README:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -44,13 +45,15 @@ from pydantic import Field
 
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import Context
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.subscriptions import InMemorySubscriptionBus, ResourceUpdated
 from mcp.types import ToolAnnotations
 
 from . import cost as C
 from . import health as H
+from . import incidents as I
 from . import models as M
 from .jobs import TERMINAL, JobConflict, JobRegistry, NotWaiting, UnknownJob
 from .stages import plan_resume
@@ -63,6 +66,38 @@ ROOT = Path(__file__).resolve().parent.parent
 SCOPE_READ, SCOPE_OPERATE, SCOPE_SEND = "pipeline:read", "pipeline:operate", "pipeline:send"
 READ_ONLY = ToolAnnotations(read_only_hint=True)
 HELD_FLAGS = ("empty_figures", "zero_entities", "lang_mismatch", "pair_incomplete", "retry_fallback", "invalid_json")
+
+# Resource cache hints (spec §5): (ttl_ms, scope) by URI prefix; the middleware applies them.
+RESOURCE_CACHE: tuple[tuple[str, int, str], ...] = (
+    ("geoecon://pricing", 3_600_000, "public"),
+    ("geoecon://incidents/template", 3_600_000, "public"),
+    ("geoecon://sources", 3_600_000, "private"),
+    ("run://", 0, "private"),            # overridden below for newsletter/archive
+    ("job://", 0, "private"),
+)
+NEWSLETTER_TTL_MS = 86_400_000
+
+
+def cache_hint_for(uri: str) -> tuple[int, str]:
+    if uri.startswith("run://") and ("/newsletter/" in uri or "/archive/" in uri):
+        return NEWSLETTER_TTL_MS, "private"
+    for prefix, ttl, scope in RESOURCE_CACHE:
+        if uri.startswith(prefix):
+            return ttl, scope
+    return 0, "private"
+
+
+class ResourceCacheMiddleware:
+    """Set `ttlMs`/`cacheScope` on resources/read results per URI. The runner has already
+    applied the server-wide hint and dumped the result by the time middleware sees it."""
+
+    async def __call__(self, ctx, call_next):
+        result = await call_next(ctx)
+        if ctx.method == "resources/read" and isinstance(result, dict):
+            ttl, scope = cache_hint_for(str((ctx.params or {}).get("uri", "")))
+            return {**result, "ttlMs": ttl, "cacheScope": scope}
+        return result
+
 
 INSTRUCTIONS = (
     "Operator's view of the geoeconomic news pipeline. Start with pipeline_health, then list_runs and "
@@ -146,6 +181,8 @@ class App:
         self.bus = InMemorySubscriptionBus()
         self.mcp: MCPServer = MCPServer(
             "geoecon-pipeline", instructions=INSTRUCTIONS, subscriptions=self.bus,
+            cache_hints={"resources/read": CacheHint(ttl_ms=0, scope="private")},
+            middleware=[ResourceCacheMiddleware()],
         )
         self._sources_cache: list | None = None
         self._tmp_db: Path | None = None
@@ -265,6 +302,7 @@ def create_server(settings: Settings | None = None, store: Store | None = None,
     app = App(settings, store, stage_factory, llm_factory)
     app._tmp_db = tmp_ref[0] if tmp_ref else None
     register_tools(app)
+    register_resources(app)
     return app
 
 
@@ -621,6 +659,97 @@ async def _progress(ctx: Context, done: int, total: int, message: str) -> None:
         await ctx.report_progress(done, total, message)
     except Exception:  # noqa: BLE001 — progress is best-effort; a host without a token gets none
         log.debug("progress report skipped", exc_info=True)
+
+
+# ── resources (spec §5) ────────────────────────────────────────────────────────────
+
+
+def _json(model_or_dict: Any) -> str:
+    if hasattr(model_or_dict, "model_dump"):
+        return model_or_dict.model_dump_json(indent=2)
+    return json.dumps(model_or_dict, indent=2, default=str)
+
+
+def register_resources(app: App) -> None:
+    mcp, store = app.mcp, app.store
+
+    def _run_or_404(run_id: str) -> dict:
+        try:
+            rid = int(run_id)
+        except ValueError:
+            raise ResourceNotFoundError(f"run://{run_id}")
+        d = store.run_detail(rid)
+        if d is None:
+            raise ResourceNotFoundError(f"run://{run_id}")
+        return d
+
+    @mcp.resource("run://{run_id}", mime_type="application/json", title="Run detail")
+    def run_resource(run_id: str) -> str:
+        """The RunDetail document: stage table, metrics, notes, next stage."""
+        d = _run_or_404(run_id)
+        detail = M.RunDetail(
+            run_id=d["run_id"], window_start=d["window_start"], window_end=d["window_end"],
+            scheduled_for=d["scheduled_for"], status=d["status"], started_at=d["started_at"],
+            finished_at=d["finished_at"], synthesis_model=d["synthesis_model"],
+            stages=[_stage_row(s) for s in d["stages"]], metrics=d["metrics"], notes=d["notes"],
+            next_stage=d["next_stage"], active_job_id=_active_job_id(app, d["run_id"]),
+        )
+        return _json(detail)
+
+    @mcp.resource("run://{run_id}/held", mime_type="application/json", title="Held records")
+    def held_resource(run_id: str) -> str:
+        """Held synthesis records of the run, as JSON."""
+        d = _run_or_404(run_id)
+        return _json([M.HeldRecord(**h).model_dump() for h in store.held_records(d["run_id"], None)])
+
+    @mcp.resource("run://{run_id}/newsletter/{bucket}", mime_type="text/html", title="Newsletter email HTML")
+    def newsletter_resource(run_id: str, bucket: str) -> str:
+        """newsletters.email_html for one bucket of the run."""
+        d = _run_or_404(run_id)
+        for n in store.newsletters(d["run_id"]):
+            if n["bucket"] == bucket:
+                return n["email_html"] or ""
+        raise ResourceNotFoundError(f"run://{run_id}/newsletter/{bucket}")
+
+    @mcp.resource("run://{run_id}/archive/{bucket}", mime_type="text/html", title="Archive HTML")
+    def archive_resource(run_id: str, bucket: str) -> str:
+        """The archive file at newsletters.archive_html_path when readable from this process;
+        otherwise a text saying where it lives."""
+        d = _run_or_404(run_id)
+        for n in store.newsletters(d["run_id"]):
+            if n["bucket"] == bucket:
+                path = n.get("archive_html_path")
+                if path and Path(path).is_file():
+                    return Path(path).read_text(encoding="utf-8")
+                raise ResourceError(f"archive for run {run_id}/{bucket} is not readable from this process; it lives at "
+                                    f"{path or '(no path recorded)'} on the pipeline's archive volume (PVC geoecon-archive)")
+        raise ResourceNotFoundError(f"run://{run_id}/archive/{bucket}")
+
+    @mcp.resource("job://{job_id}", mime_type="application/json", title="Job")
+    def job_resource(job_id: str) -> str:
+        """The Job document (same as job_status)."""
+        try:
+            row = app.registry.get(job_id)
+        except UnknownJob as e:
+            raise ResourceNotFoundError(f"job://{job_id}: {e}")
+        return _json(_job_model(app, row))
+
+    @mcp.resource("geoecon://sources", mime_type="application/json", title="Source registry")
+    def sources_resource() -> str:
+        """The registry with per-source status, tier, fetch type and bucket."""
+        return _json([{"id": s.id, "institution": s.institution, "tier": s.tier, "status": s.status,
+                       "fetch_type": s.fetch_type, "bucket": s.bucket, "country": s.country, "lang": s.lang,
+                       "curated": s.curated} for s in app.sources()])
+
+    @mcp.resource("geoecon://pricing", mime_type="application/x-yaml", title="LLM pricing table")
+    def pricing_resource() -> str:
+        """pricing.yaml as shipped with this server."""
+        return Path(app.settings.pricing_path).read_text(encoding="utf-8")
+
+    @mcp.resource("geoecon://incidents/template", mime_type="text/markdown", title="Incident report template")
+    def incident_template() -> str:
+        """The house incident-report skeleton. Fill every placeholder; keep the section order."""
+        return I.TEMPLATE
 
 
 # ── entry points ───────────────────────────────────────────────────────────────────
