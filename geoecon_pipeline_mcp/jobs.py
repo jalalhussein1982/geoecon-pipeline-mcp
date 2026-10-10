@@ -197,6 +197,13 @@ class JobRegistry:
         if runner is None:
             raise NotWaiting("job is no longer running in this process (server restarted)")
         runner.deliver_answer(approve, new_budget_usd)
+        # give the worker a moment to leave input_required so the caller sees the new state
+        import time
+        for _ in range(50):
+            row = self.get(job_id)
+            if row["status"] != "input_required":
+                return row
+            time.sleep(0.02)
         return self.get(job_id)
 
     def shutdown(self, timeout: float = 5.0) -> None:
@@ -323,6 +330,7 @@ class JobRunner(threading.Thread):
                         return
                     self._stage = stage
                     client.set_stage(stage)
+                    self._update(stage=stage)
                     try:
                         if stage in self.reg.llm_stages:
                             self._gate_estimate(stage, run)

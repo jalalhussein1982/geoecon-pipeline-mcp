@@ -477,7 +477,17 @@ def register_tools(app: App) -> None:
         """Supply the decision an `input_required` job is waiting for. Approving raises the
         budget and resumes; aborting fails the stage cleanly with fail_stage."""
         app.require(SCOPE_OPERATE)
-        raise ToolError("not implemented")
+        app.capture_loop()
+        _job(app, job_id)
+        try:
+            row = app.registry.answer(job_id, approve, new_budget_usd)
+        except NotWaiting as e:
+            raise ToolError(str(e))
+        if approve:
+            msg = f"approved; budget is now {row['budget_usd']:.4f} USD and the job is {row['status']}"
+        else:
+            msg = f"aborted at the budget gate; the stage is marked failed and the job is {row['status']}"
+        return M.Answered(job_id=job_id, status=row["status"], accepted=True, budget_usd=float(row["budget_usd"]), message=msg)
 
     @mcp.tool(title="Cancel a job",
               annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
