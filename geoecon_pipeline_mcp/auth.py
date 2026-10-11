@@ -18,10 +18,12 @@ Scopes this server uses: pipeline:read, pipeline:operate, pipeline:send.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
+import anyio
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKClientError
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
@@ -41,10 +43,23 @@ class JwtVerifier(TokenVerifier):
         self.public_key_pem = public_key_pem
         self.jwks = PyJWKClient(jwks_url, cache_keys=True) if jwks_url else None
         self.leeway_s = leeway_s
+        self._bad_kids: dict[str, float] = {}      # kid -> expiry of the negative cache entry
+        self.negative_cache_s = 30.0
 
     def _key_and_algs(self, token: str) -> tuple[Any, list[str]]:
         if self.jwks is not None:
-            return self.jwks.get_signing_key_from_jwt(token).key, ["RS256", "RS384", "RS512", "ES256", "ES384", "PS256"]
+            # An unknown kid makes PyJWKClient refetch the JWKS on every attempt; a token signed
+            # with a rotated-away key would otherwise turn each request into a network round trip.
+            kid = (jwt.get_unverified_header(token) or {}).get("kid")
+            if kid is not None and self._bad_kids.get(kid, 0.0) > time.monotonic():
+                raise PyJWKClientError(f"kid {kid!r} is negative-cached")
+            try:
+                key = self.jwks.get_signing_key_from_jwt(token).key
+            except PyJWKClientError:
+                if kid is not None:
+                    self._bad_kids[kid] = time.monotonic() + self.negative_cache_s
+                raise
+            return key, ["RS256", "RS384", "RS512", "ES256", "ES384", "PS256"]
         if self.public_key_pem:
             return self.public_key_pem, ["RS256", "RS384", "RS512", "ES256", "ES384", "PS256"]
         return self.hs256_secret, ["HS256"]
@@ -59,7 +74,9 @@ class JwtVerifier(TokenVerifier):
             return None
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        claims = self.decode(token)
+        # PyJWT and the JWKS fetch are synchronous (blocking HTTP on a cache miss); keep them off
+        # the server's event loop.
+        claims = await anyio.to_thread.run_sync(self.decode, token)
         if claims is None:
             return None
         scopes = scopes_from(claims)
