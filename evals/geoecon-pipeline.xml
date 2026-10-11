@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Read-only QA pairs over the synthetic history (GEOECON_MODE=synthetic).
+  Each <eval> has the question a host user would ask, the answer a correct agent gives from
+  the tools, and one or more <check> elements that tests/test_evals.py executes against the
+  server so every answer is verified, not assumed. `path` walks the structured result
+  ("result.0.run_id"); `len`, `expect` (JSON), `min`/`max`, `set` (JSON list, order-free) and
+  `contains` are the comparisons.
+-->
+<evals server="geoecon-pipeline" mode="synthetic" fixture="fixtures/synthetic.db" anchor="2026-10-11T08:00:00Z">
+
+  <eval id="1" tools="list_runs">
+    <question>How many pipeline runs are there and which one is the newest?</question>
+    <answer>Five runs (101-105); the newest is run 105, a completed manual smoke rerun.</answer>
+    <check tool="list_runs" args='{}' path="result" len="5"/>
+    <check tool="list_runs" args='{}' path="result.0.run_id" expect="105"/>
+    <check tool="list_runs" args='{}' path="result.0.status" expect='"completed"'/>
+  </eval>
+
+  <eval id="2" tools="list_runs">
+    <question>Which run failed, and in which stage?</question>
+    <answer>Run 103 failed in the gate stage; it completed discovery, discovery_registry and extraction (3 of 9 stages).</answer>
+    <check tool="list_runs" args='{"status": "failed"}' path="result" len="1"/>
+    <check tool="list_runs" args='{"status": "failed"}' path="result.0.run_id" expect="103"/>
+    <check tool="list_runs" args='{"status": "failed"}' path="result.0.last_failed_stage" expect='"gate"'/>
+    <check tool="list_runs" args='{"status": "failed"}' path="result.0.stages_done" expect="3"/>
+  </eval>
+
+  <eval id="3" tools="run_status failed_stage_error">
+    <question>What does the stored error of run 103 say, and where would a resume start?</question>
+    <answer>A NullGateError: the gate kept 0 of 228 articles because every verdict came back unparsable; the stage ran 2900 s. A resume starts at gate again, not after it.</answer>
+    <check tool="failed_stage_error" args='{"run_id": 103}' path="stage_name" expect='"gate"'/>
+    <check tool="failed_stage_error" args='{"run_id": 103}' path="error" contains="NullGateError"/>
+    <check tool="failed_stage_error" args='{"run_id": 103}' path="error" contains="0 of 228"/>
+    <check tool="failed_stage_error" args='{"run_id": 103}' path="duration_s" expect="2900.0"/>
+    <check tool="run_status" args='{"run_id": 103}' path="next_stage" expect='"gate"'/>
+  </eval>
+
+  <eval id="4" tools="list_gate_rejections">
+    <question>Were run 103's gate rejections the model's judgement or a backend failure?</question>
+    <answer>A backend failure: all 228 dropped articles were dropped unjudged (unparsed_dropped equals total_dropped), so the model never produced a verdict.</answer>
+    <check tool="list_gate_rejections" args='{"run_id": 103, "limit": 5}' path="total_dropped" expect="228"/>
+    <check tool="list_gate_rejections" args='{"run_id": 103, "limit": 5}' path="unparsed_dropped" expect="228"/>
+    <check tool="list_gate_rejections" args='{"run_id": 103, "limit": 5}' path="items.0.unparsed" expect="true"/>
+  </eval>
+
+  <eval id="5" tools="list_held_records run_status">
+    <question>How many synthesis records did the validator hold in run 102, and why?</question>
+    <answer>Three of 24 records: one empty_figures, one zero_entities, one invalid_json; 21 records shipped.</answer>
+    <check tool="list_held_records" args='{"run_id": 102}' path="result" len="3"/>
+    <check tool="list_held_records" args='{"run_id": 102}' path="result.*.flag" set='["empty_figures", "zero_entities", "invalid_json"]'/>
+    <check tool="run_status" args='{"run_id": 102}' path="metrics.records_total" expect="24"/>
+    <check tool="run_status" args='{"run_id": 102}' path="metrics.records_ok" expect="21"/>
+  </eval>
+
+  <eval id="6" tools="source_health">
+    <question>Which live registry sources produced nothing in run 102?</question>
+    <answer>Two live sources were silent: ae_mof and co_cb_banrep. The 25 needs_review sources are held and the 28 retired ones are expected not to be live; neither is a failure.</answer>
+    <check tool="source_health" args='{"run_id": 102}' path="result" len="66"/>
+    <check tool="source_health" args='{"run_id": 102}' path="result[state=silent].registry_id" set='["ae_mof", "co_cb_banrep"]'/>
+    <check tool="source_health" args='{"run_id": 102}' path="result[state=held]" len="25"/>
+  </eval>
+
+  <eval id="7" tools="source_health">
+    <question>What can source_health say about run 101?</question>
+    <answer>Nothing: run 101 predates the discovery_registry stage, so every one of the 66 sources is reported as unknown rather than silent.</answer>
+    <check tool="source_health" args='{"run_id": 101}' path="result[state=unknown]" len="66"/>
+  </eval>
+
+  <eval id="8" tools="pipeline_health run_status">
+    <question>Is the pipeline healthy this morning?</question>
+    <answer>No. The watchdog says today's run (105) completed but sent no newsletter, and run 104 is still marked running nine hours after it started (one stale run), which reconcile_abandoned would close out.</answer>
+    <check tool="pipeline_health" args='{}' path="ok" expect="false"/>
+    <check tool="pipeline_health" args='{}' path="subject" contains="no newsletter"/>
+    <check tool="pipeline_health" args='{}' path="latest_run_id" expect="105"/>
+    <check tool="pipeline_health" args='{}' path="stale_run_ids" expect="[104]"/>
+    <check tool="run_status" args='{"run_id": 104}' path="status" expect='"running"'/>
+    <check tool="run_status" args='{"run_id": 105}' path="metrics.send_status" expect='"skipped_empty"'/>
+  </eval>
+
+  <eval id="9" tools="preview_resume">
+    <question>What would resuming run 103 do and roughly what would it cost?</question>
+    <answer>Run gate, cluster, synthesis, summary and render with the run's original window (ending 2026-10-09 23:00Z); send is withheld. Estimated about 0.10 USD at the placeholder prices, under the 2.00 USD default budget, so no approval prompt.</answer>
+    <check tool="preview_resume" args='{"run_id": 103}' path="remaining" expect='["gate", "cluster", "synthesis", "summary", "render"]'/>
+    <check tool="preview_resume" args='{"run_id": 103}' path="send_withheld" expect="true"/>
+    <check tool="preview_resume" args='{"run_id": 103}' path="window_end" contains="2026-10-09T23:00:00"/>
+    <check tool="preview_resume" args='{"run_id": 103}' path="estimated_usd" min="0.09" max="0.12"/>
+    <check tool="preview_resume" args='{"run_id": 103}' path="would_require_approval" expect="false"/>
+  </eval>
+
+  <eval id="10" tools="cost_report">
+    <question>How much has this server spent on run 103 so far?</question>
+    <answer>Nothing: no job has run on it, so the report is 0 USD and partial, because the three completed stages (discovery, discovery_registry, extraction) ran in the CronJob which keeps no token ledger.</answer>
+    <check tool="cost_report" args='{"run_id": 103}' path="estimated_usd" expect="0.0"/>
+    <check tool="cost_report" args='{"run_id": 103}' path="partial" expect="true"/>
+    <check tool="cost_report" args='{"run_id": 103}' path="stages_without_usage" expect='["discovery", "discovery_registry", "extraction"]'/>
+    <check tool="cost_report" args='{"run_id": 103}' path="pricing_as_of" expect='"2026-10-11"'/>
+  </eval>
+
+</evals>

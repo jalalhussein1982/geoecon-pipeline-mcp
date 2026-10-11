@@ -321,6 +321,7 @@ def create_server(settings: Settings | None = None, store: Store | None = None,
     app._tmp_db = tmp_ref[0] if tmp_ref else None
     register_tools(app)
     register_resources(app)
+    register_prompts(app)
     return app
 
 
@@ -768,6 +769,27 @@ def register_resources(app: App) -> None:
     def incident_template() -> str:
         """The house incident-report skeleton. Fill every placeholder; keep the section order."""
         return I.TEMPLATE
+
+
+# ── prompts (spec §5) ──────────────────────────────────────────────────────────────
+
+
+def register_prompts(app: App) -> None:
+    mcp = app.mcp
+
+    @mcp.prompt(title="Write an incident report")
+    def write_incident_report(
+        run_id: Annotated[int, Field(description="The run the incident is about, e.g. the failed run from list_runs.")],
+    ) -> str:
+        """Produce the house-format incident report (status line, facts table, root cause, fixes P0-P3,
+        tests, follow-up) from the tools' numbers; never from memory."""
+        app.run(run_id)
+        return I.incident_prompt(run_id)
+
+    @mcp.prompt(title="Morning check")
+    def morning_check() -> str:
+        """The operator's five-line checklist: health, latest run, silent sources, held records, one recommendation."""
+        return I.morning_check_prompt()
 
 
 # ── entry points ───────────────────────────────────────────────────────────────────

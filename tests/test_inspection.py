@@ -53,7 +53,7 @@ async def test_run_status_103_names_gate_as_next_stage(client: Client):
 @pytest.mark.anyio
 async def test_failed_stage_error_returns_the_stored_text(client: Client):
     e = await call(client, "failed_stage_error", run_id=103)
-    assert e["stage_name"] == "gate" and "NullGateError" in e["error"] and "0 of 240" in e["error"]
+    assert e["stage_name"] == "gate" and "NullGateError" in e["error"] and "0 of 228" in e["error"]
     assert e["duration_s"] == 2900.0
     r = await client.call_tool("failed_stage_error", {"run_id": 102})
     assert r.is_error is True and "no failed stage" in r.content[0].text

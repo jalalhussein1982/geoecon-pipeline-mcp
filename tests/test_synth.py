@@ -34,7 +34,7 @@ def test_run_103_failed_in_gate_and_resumes_at_gate(store):
     assert d["status"] == "failed"
     gate = next(s for s in d["stages"] if s["stage_name"] == "gate")
     assert gate["status"] == "failed"
-    assert "NullGateError" in gate["error"] and "0 of 240" in gate["error"]
+    assert "NullGateError" in gate["error"] and "0 of 228" in gate["error"]
     assert d["next_stage"] == "gate"                       # Review Focus 1: failed stage is re-run, not skipped
     assert d["completed_stages"] == ["discovery", "discovery_registry", "extraction"]
     assert d["window_end"] - d["window_start"] == timedelta(hours=24)

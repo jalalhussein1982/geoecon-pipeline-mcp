@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "geoecon-pipeline": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python", "-m", "geoecon_pipeline_mcp.server", "--stdio"],
+      "env": { "GEOECON_MODE": "synthetic" }
+    }
+  }
+}

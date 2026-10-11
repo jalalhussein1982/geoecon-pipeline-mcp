@@ -1,0 +1,89 @@
+# geoecon-pipeline-mcp next to the daily CronJob: one replica, Streamable HTTP, OAuth
+# resource server. Apply after deploy/secret.example.yaml has been filled in and renamed.
+#
+#   kubectl -n hussein-ns apply -f deploy/mcp-deployment.yaml
+#
+# Put the cluster ingress (TLS) in front of the Service; AUTH_RESOURCE_URL must equal the
+# public URL clients use (the token's `aud`).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geoecon-pipeline-mcp
+  namespace: hussein-ns
+  labels: { app: geoecon, role: mcp }
+spec:
+  replicas: 1                     # jobs run in-process; a second replica would race on them
+  strategy: { type: Recreate }    # never two replicas during a rollout
+  selector:
+    matchLabels: { app: geoecon, role: mcp }
+  template:
+    metadata:
+      # app: geoecon is REQUIRED — geoecon-db-netpol admits only that label to Postgres:5432
+      labels: { app: geoecon, role: mcp }
+    spec:
+      terminationGracePeriodSeconds: 60   # let a running stage's current LLM batch finish
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: mcp
+          # Build from ./Dockerfile; keep the pinned geoecon commit equal to the CronJob image's.
+          image: jalalhussein/geoecon-pipeline-mcp:0.1.0
+          args: ["--http", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: false   # the server writes nothing in postgres mode; left off for logs
+          envFrom:
+            - secretRef: { name: geoecon-secrets }      # the CronJob's: MAETCENTRUM_KEY, SMTP_*, FROM_ADDR, RECIPIENTS
+            - secretRef: { name: geoecon-mcp-auth }     # deploy/secret.example.yaml
+          env:
+            - name: GEOECON_MODE
+              value: "postgres"
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: geoecon-db-app, key: username } }
+            - name: DB_PASS
+              valueFrom: { secretKeyRef: { name: geoecon-db-app, key: password } }
+            - name: DB_DSN
+              value: "postgresql://$(DB_USER):$(DB_PASS)@geoecon-db-rw:5432/geoeconomics"
+            - name: SOURCES_PATH
+              value: "/app/config/sources.yaml"
+            - name: PRICING_PATH
+              value: "/app/pricing.yaml"
+            # Same model switches as deploy/cronjob.yaml so estimates price the right model.
+            - { name: GATE_MODEL, value: "gemma4" }
+            - { name: SYNTHESIS_MODEL, value: "gemma4" }
+            - { name: DEDUP_MODEL, value: "gemma4" }
+            - { name: SEARCH_DISCOVERY, value: "false" }
+            - { name: GDELT_MODE, value: "gkg" }
+            - { name: DEFAULT_BUDGET_USD, value: "2.00" }
+          readinessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 30
+          resources:
+            # A resumed run executes the pipeline's stages in this pod; size like the CronJob.
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits: { cpu: "2", memory: "6Gi" }
+          volumeMounts:
+            - { name: archive, mountPath: /data/archive, readOnly: true }   # run://{id}/archive/{bucket}
+      volumes:
+        - name: archive
+          persistentVolumeClaim: { claimName: geoecon-archive }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: geoecon-pipeline-mcp
+  namespace: hussein-ns
+  labels: { app: geoecon, role: mcp }
+spec:
+  selector: { app: geoecon, role: mcp }
+  ports:
+    - { name: http, port: 80, targetPort: http }

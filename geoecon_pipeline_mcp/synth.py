@@ -4,7 +4,7 @@
 
     101  completed, sent (older run: no discovery_registry stage row, GDELT only)
     102  completed, sent, 3 held records; two live registry sources produced zero rows
-    103  failed in `gate`: every verdict unparsable (invented text), resume must start at gate
+    103  failed in `gate`: all 228 judged verdicts unparsable (invented text), resume must start at gate
     104  running, stale: started 9 h before the fixture's anchor instant, gate half-judged
     105  completed: a LIMIT=50 smoke rerun that kept nothing -> send_status=skipped_empty
 
@@ -88,10 +88,11 @@ HELD_RECORDS_102 = (
 HELD_RECORDS_101 = (
     ("retry_fallback", ["first pass returned an empty record; retry also failed validation"], "hold"),
 )
+# 240 articles were discovered; 12 failed extraction and are never judged, so the gate saw 228.
 GATE_103_ERROR = (
-    "NullGateError: gate kept 0 of 240 articles; every verdict came back unparsable "
-    "(gate_unparsed_dropped=240/240) — refusing to hand an empty article set downstream. "
-    "{'gate_total': 240, 'gate_kept': 0, 'gate_dropped': 240, 'gate_unparsed': 240, 'gate_unparsed_dropped': 240}"
+    "NullGateError: gate kept 0 of 228 articles; every verdict came back unparsable "
+    "(gate_unparsed_dropped=228/228) — refusing to hand an empty article set downstream. "
+    "{'gate_total': 228, 'gate_kept': 0, 'gate_dropped': 228, 'gate_unparsed': 228, 'gate_unparsed_dropped': 228}"
 )
 
 log = logging.getLogger("geoecon_pipeline_mcp.synth")
