@@ -120,7 +120,20 @@ FROM articles a WHERE a.run_id = %s GROUP BY a.run_id
 
 JOB_COLUMNS = ("job_id", "kind", "run_id", "stages_planned", "status", "stage", "progress", "input_request",
                "input_response", "budget_usd", "usage", "result", "error", "principal", "trace",
-               "created_at", "updated_at", "finished_at", "ttl_expires_at")
+               "created_at", "updated_at", "finished_at", "ttl_expires_at", "owner_id", "heartbeat_at")
+
+# params: (error, now, ttl, now, job_id) — only an active row changes
+JOB_FAIL_IF_ACTIVE = """
+UPDATE mcp_jobs SET status = 'failed', error = %s, finished_at = %s, ttl_expires_at = %s, input_request = NULL,
+       updated_at = %s
+WHERE job_id = %s::uuid AND status IN ('working','input_required')
+RETURNING job_id
+"""
+# params: (now, [job_ids])
+JOB_HEARTBEAT = """
+UPDATE mcp_jobs SET heartbeat_at = %s
+WHERE job_id = ANY(%s::uuid[]) AND status IN ('working','input_required')
+"""
 
 JOB_INSERT = f"""
 INSERT INTO mcp_jobs({', '.join(JOB_COLUMNS)})

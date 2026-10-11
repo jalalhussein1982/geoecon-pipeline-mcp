@@ -14,7 +14,7 @@ transport.
 
 | Capability | How | Where |
 |---|---|---|
-| Long-running work with **durable handles** | `start_job` inserts an `mcp_jobs` row and returns a job id at once; a thread does the work; any host polls `job_status(job_id)`; a dropped connection loses nothing | `jobs.py`, `tests/test_jobs.py` |
+| Long-running work with **durable handles** | `start_job` inserts an `mcp_jobs` row and returns a job id at once; a thread in this server process does the work; any client of this server instance polls `job_status(job_id)`; a dropped connection loses nothing (the row is durable, the thread is not) | `jobs.py`, `tests/test_jobs.py` |
 | **Progress** | `job_status.progress` from the pipeline's own log lines and row counts; `preview_resume`/`source_health` report progress on their own request stream | `progress.py` |
 | **`subscriptions/listen`** change notifications | `ResourceUpdated` on `job://{id}` at every status change and `run://{id}` at every stage boundary, published from the worker thread onto the server's bus | `tests/test_notifications.py` |
 | **Cost gate** | every LLM stage is estimated first; above budget the job parks in `input_required` with a form-shaped request; a counting proxy enforces the ceiling between LLM calls; `answer_job` approves or aborts | `cost.py`, `tests/test_budget.py` |

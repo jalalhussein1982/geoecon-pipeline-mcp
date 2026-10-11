@@ -68,6 +68,8 @@ class Store(Protocol):
     def job_insert(self, job: dict) -> None: ...
     def job_get(self, job_id: str) -> dict | None: ...
     def job_update(self, job_id: str, **fields: Any) -> None: ...
+    def job_fail_if_active(self, job_id: str, error: str) -> bool: ...
+    def job_heartbeat(self, job_ids: list[str], now: datetime) -> None: ...
     def jobs_working(self) -> list[dict]: ...
     def jobs_for_run(self, run_id: int) -> list[dict]: ...
 
@@ -188,13 +190,18 @@ CREATE TABLE IF NOT EXISTS mcp_jobs (
     budget_usd REAL NOT NULL DEFAULT 0, usage TEXT NOT NULL DEFAULT '{}',
     result TEXT, error TEXT,
     principal TEXT, trace TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT, ttl_expires_at TEXT
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT, ttl_expires_at TEXT,
+    owner_id TEXT, heartbeat_at TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 _JOB_JSON = ("stages_planned", "progress", "input_request", "input_response", "usage", "result", "trace")
-_JOB_TS = ("created_at", "updated_at", "finished_at", "ttl_expires_at")
+_JOB_TS = ("created_at", "updated_at", "finished_at", "ttl_expires_at", "heartbeat_at")
+_JOB_COLUMNS = ("job_id", "kind", "run_id", "stages_planned", "status", "stage", "progress", "input_request",
+                "input_response", "budget_usd", "usage", "result", "error", "principal", "trace",
+                "created_at", "updated_at", "finished_at", "ttl_expires_at", "owner_id", "heartbeat_at")
+ACTIVE_JOB_STATUSES = ("working", "input_required")
 
 
 class SyntheticStore:
@@ -207,9 +214,17 @@ class SyntheticStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SYNTH_SCHEMA)
+        self._migrate_jobs_columns()
         self._fixed_now = now
 
     # -- infrastructure -------------------------------------------------------------
+
+    def _migrate_jobs_columns(self) -> None:
+        """Databases built before owner_id/heartbeat_at existed get the columns added."""
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(mcp_jobs)").fetchall()}
+        for col in ("owner_id", "heartbeat_at"):
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE mcp_jobs ADD COLUMN {col} TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -219,9 +234,9 @@ class SyntheticStore:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
-    def _x(self, sql: str, params: tuple = ()) -> None:
+    def _x(self, sql: str, params: tuple = ()) -> int:
         with self._lock:
-            self._conn.execute(sql, params)
+            return self._conn.execute(sql, params).rowcount
 
     def meta_get(self, key: str) -> str | None:
         rows = self._q("SELECT value FROM meta WHERE key=?", (key,))
@@ -453,9 +468,7 @@ class SyntheticStore:
         return d
 
     def job_insert(self, job: dict) -> None:
-        cols = ["job_id", "kind", "run_id", "stages_planned", "status", "stage", "progress", "input_request",
-                "input_response", "budget_usd", "usage", "result", "error", "principal", "trace",
-                "created_at", "updated_at", "finished_at", "ttl_expires_at"]
+        cols = list(_JOB_COLUMNS)
         vals = []
         for c in cols:
             v = job.get(c)
@@ -483,6 +496,22 @@ class SyntheticStore:
             sets.append(f"{k}=?"); vals.append(v)
         vals.append(job_id)
         self._x(f"UPDATE mcp_jobs SET {', '.join(sets)} WHERE job_id=?", tuple(vals))
+
+    def job_fail_if_active(self, job_id: str, error: str) -> bool:
+        """Mark a job failed only if it is still active; a row that reached a terminal state in
+        the meantime is left exactly as it is. Returns whether a row was changed."""
+        now = datetime.now(timezone.utc)
+        n = self._x("UPDATE mcp_jobs SET status='failed', error=?, finished_at=?, ttl_expires_at=?, input_request=NULL, "
+                    "updated_at=? WHERE job_id=? AND status IN ('working','input_required')",
+                    (error, iso(now), iso(now + JOB_TTL), iso(now), job_id))
+        return n > 0
+
+    def job_heartbeat(self, job_ids: list[str], now: datetime) -> None:
+        if not job_ids:
+            return
+        marks = ",".join("?" * len(job_ids))
+        self._x(f"UPDATE mcp_jobs SET heartbeat_at=? WHERE job_id IN ({marks}) AND status IN ('working','input_required')",
+                (iso(now), *job_ids))
 
     def jobs_working(self) -> list[dict]:
         return [self._job_row(r) for r in

@@ -69,16 +69,19 @@ start_job ──▶ row(status=working) ──▶ thread ──┬─ for each p
 ```
 
 * A job is a row first: `start_job` inserts it and returns before the thread has done anything.
-  Any host can poll the id; a dropped connection loses nothing.
+  Any client of this server instance can poll the id; a dropped connection loses nothing. The row
+  carries `owner_id` (this process) and a `heartbeat_at` refreshed every 3 s while the job is active.
 * The status vocabulary is exactly the tasks extension's: `working | input_required |
   completed | failed | cancelled`. Terminal rows get `ttl_expires_at = now + 14 d`;
   `job_status` on an expired or unknown id is a `ToolError` naming `start_job`/`list_runs`.
 * Cooperation points: between stages (always), between LLM calls (the counting client), and
   while waiting for a budget answer. `cancel_job` sets a flag and wakes the waiter; the
   running LLM call finishes, the next one raises.
-* Restart: `JobRegistry.__init__` marks every `working`/`input_required` row `failed` with
-  `error="server restarted"`. The pipeline's stage row stays `running`/`failed`;
-  `pipeline_health` then reports the stale run, as the watchdog would.
+* Restart: `JobRegistry.__init__` fails every active row whose heartbeat is older than 30 s (or
+  absent) with `error="server restarted"`, through a conditional update that never touches a row
+  that reached a terminal state in the meantime; a row with a fresh heartbeat belongs to another
+  live process on the same database and is left alone. The pipeline's stage row stays
+  `running`/`failed`; `pipeline_health` then reports the stale run, as the watchdog would.
 * One replica. Two replicas would race on `active_for_run` and would need a shared
   `SubscriptionBus`; the README says so.
 

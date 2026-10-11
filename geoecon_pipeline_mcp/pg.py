@@ -227,7 +227,7 @@ class PostgresStore:
         d["usage"] = d.get("usage") or {}
         d["trace"] = d.get("trace") or {}
         d["budget_usd"] = float(d["budget_usd"]) if d.get("budget_usd") is not None else 0.0
-        for k in ("created_at", "updated_at", "finished_at", "ttl_expires_at"):
+        for k in ("created_at", "updated_at", "finished_at", "ttl_expires_at", "heartbeat_at"):
             d[k] = _aware(d.get(k))
         return d
 
@@ -255,6 +255,17 @@ class PostgresStore:
             sets.append(f"{k} = %s"); vals.append(v)
         vals.append(str(job_id))
         self._exec(f"UPDATE mcp_jobs SET {', '.join(sets)} WHERE job_id = %s::uuid", tuple(vals))
+
+    def job_fail_if_active(self, job_id: str, error: str) -> bool:
+        from .store import JOB_TTL
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            row = self.conn.execute(Q.JOB_FAIL_IF_ACTIVE, (error, now, now + JOB_TTL, now, str(job_id))).fetchone()
+        return row is not None
+
+    def job_heartbeat(self, job_ids: list[str], now: datetime) -> None:
+        if job_ids:
+            self._exec(Q.JOB_HEARTBEAT, (now, [str(j) for j in job_ids]))
 
     def jobs_working(self) -> list[dict]:
         return [self._job_row(r) for r in self._rows(Q.JOBS_WORKING)]

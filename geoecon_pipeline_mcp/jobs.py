@@ -21,7 +21,10 @@ stage row stays `running` or `failed`, and pipeline_health reports the stale run
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -40,6 +43,8 @@ StageFactory = Callable[[Any], Mapping[str, StageFn]]
 Notify = Callable[[str], None]
 
 TERMINAL = frozenset({"completed", "failed", "cancelled"})
+HEARTBEAT_S = 3.0                       # how often a live runner refreshes heartbeat_at
+HEARTBEAT_STALE = timedelta(seconds=30)  # older than this and the owning process is presumed dead
 BUDGET_SCHEMA = {
     "type": "object",
     "properties": {
@@ -88,6 +93,8 @@ class JobRegistry:
         poll_after_s: float = 2.0,
         llm_stages: frozenset[str] = LLM_STAGES,
         db_progress: bool = False,
+        heartbeat_s: float = HEARTBEAT_S,
+        heartbeat_stale: timedelta = HEARTBEAT_STALE,
     ):
         self.store = store
         self.stage_factory = stage_factory
@@ -101,6 +108,11 @@ class JobRegistry:
         self.db_progress = db_progress
         self._runners: dict[str, JobRunner] = {}
         self._lock = threading.Lock()
+        self.owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.heartbeat_s = heartbeat_s
+        self.heartbeat_stale = heartbeat_stale
+        self._stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
         self.recovered = self.recover_after_restart()
 
     # -- hooks --------------------------------------------------------------------------
@@ -122,14 +134,39 @@ class JobRegistry:
     # -- lifecycle ----------------------------------------------------------------------
 
     def recover_after_restart(self) -> int:
+        """Fail active rows that no live process owns. A row with a fresh heartbeat belongs to
+        another server process on the same database and is left alone; rows from this process's
+        previous life (or legacy rows without a heartbeat) are failed with the conditional update,
+        so a row that completed in between is never overwritten."""
         n = 0
+        cutoff = _now() - self.heartbeat_stale
         for j in self.store.jobs_working():
-            self.store.job_update(j["job_id"], status="failed", error="server restarted",
-                                  finished_at=_now(), ttl_expires_at=_now() + JOB_TTL, input_request=None)
-            n += 1
+            if j.get("owner_id") == self.owner_id:
+                continue
+            hb = j.get("heartbeat_at")
+            if hb is not None and hb > cutoff:
+                log.info("job %s is owned by live process %s; leaving it", j["job_id"], j.get("owner_id"))
+                continue
+            if self.store.job_fail_if_active(j["job_id"], "server restarted"):
+                n += 1
         if n:
             log.warning("marked %d job(s) failed after restart", n)
         return n
+
+    def _ensure_heartbeat(self) -> None:
+        if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="job-heartbeat", daemon=True)
+            self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.wait(self.heartbeat_s):
+            ids = list(self._runners)
+            if not ids:
+                continue
+            try:
+                self.store.job_heartbeat(ids, _now())
+            except Exception:  # noqa: BLE001 — a missed heartbeat is survivable; a dead loop is not
+                log.warning("heartbeat failed", exc_info=True)
 
     def active_for_run(self, run_id: int) -> str | None:
         for j in self.store.jobs_for_run(run_id):
@@ -151,13 +188,14 @@ class JobRegistry:
                 "budget_usd": float(self.default_budget_usd if budget_usd is None else budget_usd),
                 "usage": C.empty_usage(), "result": None, "error": None, "principal": principal,
                 "trace": dict(trace or {}), "created_at": now, "updated_at": now, "finished_at": None,
-                "ttl_expires_at": None,
+                "ttl_expires_at": None, "owner_id": self.owner_id, "heartbeat_at": now,
             }
             if note:
                 job["trace"] = {**job["trace"], "note": note}
             self.store.job_insert(job)
             runner = JobRunner(self, job)
             self._runners[job["job_id"]] = runner
+            self._ensure_heartbeat()
         runner.start()
         self.notify(f"job://{job['job_id']}")
         return job
@@ -178,9 +216,13 @@ class JobRegistry:
             return row
         runner = self._runners.get(job_id)
         if runner is None:
-            # row says working but no thread owns it (should only happen after a crash)
-            self.store.job_update(job_id, status="failed", error="server restarted", finished_at=_now(),
-                                  ttl_expires_at=_now() + JOB_TTL)
+            # row says active but no thread in this process owns it: another process's job, or an
+            # orphan. Only an orphan may be failed, and only if it is still active right now.
+            hb = row.get("heartbeat_at")
+            if row.get("owner_id") not in (None, self.owner_id) and hb is not None and hb > _now() - self.heartbeat_stale:
+                raise NotWaiting(f"job {job_id} is running in another server process ({row.get('owner_id')}); "
+                                 "cancel it there")
+            self.store.job_fail_if_active(job_id, "server restarted")
             return self.get(job_id)
         runner.request_cancel()
         return self.get(job_id)
@@ -211,6 +253,7 @@ class JobRegistry:
         return self.get(job_id)
 
     def shutdown(self, timeout: float = 5.0) -> None:
+        self._stop.set()
         for r in list(self._runners.values()):
             r.request_cancel()
         for r in list(self._runners.values()):

@@ -197,3 +197,34 @@ async def test_cancelled_job_leaves_the_run_failed_not_running(client, app):
     await call(client, "cancel_job", job_id=h["job_id"])
     assert (await poll(client, h["job_id"]))["status"] == "cancelled"
     assert app.store.run_detail(103)["status"] == "failed"
+
+
+def test_stage_set_close_is_called_when_the_job_ends(store):
+    """Operator mode opens a database connection per job for the stage functions; the runner must
+    close it whether the job completes or fails."""
+    from geoecon_pipeline_mcp import cost
+    from geoecon_pipeline_mcp.jobs import JobRegistry
+    from geoecon_pipeline_mcp.synth import FakeLLM
+    from .conftest import ROOT
+
+    closed = []
+
+    class StageSet(dict):
+        def close(self):
+            closed.append(True)
+
+    def factory(client):
+        return StageSet(render=lambda run, report, cancel: {"ok": 1},
+                        gate=lambda run, report, cancel: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    reg = JobRegistry(store, factory, pricing=cost.Pricing.load(ROOT / "pricing.yaml"), stage_models={}, llm_factory=FakeLLM)
+    import time
+    for stages_, expected in ((["render"], "completed"), (["gate"], "failed")):
+        job = reg.start("run_stage", 105 if stages_ == ["render"] else 103, stages_, 1.0, "t", {})
+        for _ in range(300):
+            if reg.get(job["job_id"])["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.01)
+        assert reg.get(job["job_id"])["status"] == expected
+    assert closed == [True, True]
+    reg.shutdown()

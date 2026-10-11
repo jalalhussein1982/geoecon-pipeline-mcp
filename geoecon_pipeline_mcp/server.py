@@ -582,7 +582,10 @@ def register_tools(app: App) -> None:
         if before["status"] in TERMINAL:
             return M.Cancelled(job_id=job_id, status=before["status"],
                                message=f"job already {before['status']}; nothing to cancel")
-        row = app.registry.cancel(job_id)
+        try:
+            row = app.registry.cancel(job_id)
+        except NotWaiting as e:
+            raise ToolError(str(e))
         return M.Cancelled(job_id=job_id, status=row["status"],
                            message="cancel requested; the runner stops at the next stage or LLM-batch boundary"
                            if row["status"] not in TERMINAL else f"job {row['status']}")

@@ -116,3 +116,46 @@ def test_http_on_a_non_loopback_host_without_auth_is_refused(monkeypatch):
         S.main(["--http", "--host", "127.0.0.1"])                               # loopback dev is allowed
     with pytest.raises(RuntimeError, match="stop"):
         S.main(["--stdio"])
+
+
+# ── JWKS: off the event loop, unknown kids negative-cached (finding 8) ──────────────────
+
+
+@pytest.mark.anyio
+async def test_unknown_kid_is_negative_cached(monkeypatch):
+    from jwt import PyJWKClientError
+
+    class FakeJWKS:
+        fetches = 0
+
+        def get_signing_key_from_jwt(self, token):
+            self.fetches += 1
+            raise PyJWKClientError("Unable to find a signing key that matches: kid")
+
+    v = JwtVerifier(issuer=ISS, audience=AUD, jwks_url="https://issuer.test/jwks")
+    v.jwks = FakeJWKS()
+    tok = jwt.encode({"iss": ISS, "aud": AUD, "sub": "s", "exp": int(time.time()) + 60}, "k" * 32, algorithm="HS256",
+                     headers={"kid": "rotated-away"})
+    assert await v.verify_token(tok) is None
+    assert await v.verify_token(tok) is None
+    assert await v.verify_token(tok) is None
+    assert v.jwks.fetches == 1                                                 # the next two never hit the network
+    v._bad_kids["rotated-away"] = 0.0                                          # cache entry expired
+    assert await v.verify_token(tok) is None
+    assert v.jwks.fetches == 2
+
+
+@pytest.mark.anyio
+async def test_decode_runs_in_a_worker_thread(monkeypatch, verifier):
+    import threading
+    seen = []
+    original = verifier.decode
+
+    def spy(token):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return original(token)
+
+    monkeypatch.setattr(verifier, "decode", spy)
+    tok = mint_hs256(SECRET, issuer=ISS, audience=AUD, subject="s", scopes=["pipeline:read"])
+    assert (await verifier.verify_token(tok)).scopes == ["pipeline:read"]
+    assert seen == [False]                                                     # PyJWT/JWKS I/O never blocks the loop
