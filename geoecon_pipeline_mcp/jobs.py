@@ -352,7 +352,7 @@ class JobRunner(threading.Thread):
             inner = self.reg.llm_factory()
             client = C.CountingLLMClient(inner, self.reg.pricing, self.budget, self.usage,
                                          on_exceeded=self._on_budget_exceeded, cancel=self.cancel,
-                                         aborted=self.aborted, on_usage=lambda: self._update(usage=self.usage))
+                                         aborted=self.aborted, on_usage=lambda snap: self._update(usage=snap))
             fns = self.reg.stage_factory(client)
             counter = LogCounter(self._report, threading.get_ident())
             db_counter = None

@@ -14,6 +14,8 @@ answers. Cancel is checked at the same boundary.
 
 from __future__ import annotations
 
+import copy
+import logging
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -23,6 +25,8 @@ from typing import Any
 import yaml
 
 from .store import LLM_STAGES, Store
+
+log = logging.getLogger("geoecon_pipeline_mcp.cost")
 
 # Estimator constants (spec §4.3). Tokens, not characters; ~4 chars per token.
 GATE_BATCH_SIZE = 15
@@ -114,7 +118,7 @@ class CountingLLMClient:
 
     def __init__(self, inner: Any, pricing: Pricing, budget: Budget, usage: dict[str, Any], *,
                  on_exceeded: Callable[[float], None] | None = None, cancel: threading.Event | None = None,
-                 aborted: threading.Event | None = None, on_usage: Callable[[], None] | None = None):
+                 aborted: threading.Event | None = None, on_usage: Callable[[dict[str, Any]], None] | None = None):
         self.inner = inner
         self.pricing = pricing
         self.budget = budget
@@ -160,11 +164,14 @@ class CountingLLMClient:
             self.calls += 1
             call_usd = add_usage(self.usage, self.stage, model, pt, ct, self.pricing)
             self.budget.spent_usd = round(self.budget.spent_usd + call_usd, 6)
-        if self.on_usage is not None:
+            # Snapshot under the lock: four gate workers mutate `usage` concurrently, and a
+            # json.dumps of the live dict from another thread can see it change size mid-walk.
+            snapshot = copy.deepcopy(self.usage) if self.on_usage is not None else None
+        if snapshot is not None:
             try:
-                self.on_usage()
-            except Exception:  # noqa: BLE001 — persisting usage is best-effort per call
-                pass
+                self.on_usage(snapshot)
+            except Exception:  # noqa: BLE001 — persisting usage is best-effort per call, but say so
+                log.warning("could not persist LLM usage after a %s call", self.stage, exc_info=True)
 
 
 def stage_models_from_config(cfg: Any) -> dict[str, str]:
