@@ -200,8 +200,9 @@ class App:
                 lf = llm_factory or (lambda: FakeLLM(settings.fake_prompt_tokens, settings.fake_completion_tokens))
             else:
                 from .pg import pipeline_factories
-                psf, plf = pipeline_factories(settings, store)
+                psf, plf, cfg = pipeline_factories(settings, store)
                 sf, lf = stage_factory or psf, llm_factory or plf
+                self.stage_models = C.stage_models_from_config(cfg)   # what the stages will actually call
         else:
             sf, lf = stage_factory, llm_factory
         self.registry = JobRegistry(

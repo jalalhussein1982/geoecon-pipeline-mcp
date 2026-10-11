@@ -315,15 +315,20 @@ async def test_runtime_overspend_approval_without_a_number_is_refused(synthetic_
 
 
 def test_second_llm_stage_is_gated_against_what_is_left(store):
-    """Budget 0.026: gate's estimate (0.0235) fits and the fake gate spends exactly that, leaving
-    0.0025; cluster's estimate (0.0037) must now prompt even though it is far below the total."""
+    """Budget 0.025: gate's estimate (0.0235) fits and the fake gate spends exactly that, leaving
+    0.0015; cluster's estimate (~0.0033 for 60 kept articles in 3 countries) must now prompt even
+    though it is far below the total ceiling."""
     from geoecon_pipeline_mcp.jobs import JobRegistry
 
     def factory(client):
         def gate(run, report, cancel):
             for _ in range(16):
                 client.complete("deepseek-v3.2", [])
-            return {"gate_total": 240}
+            store.execute("UPDATE articles SET gate_geoeconomic=1, gate_score=0.8, "
+                          "gate_country=CASE article_id % 3 WHEN 0 THEN 'SA' WHEN 1 THEN 'BR' ELSE 'EG' END, "
+                          "country_fips=CASE article_id % 3 WHEN 0 THEN 'SA' WHEN 1 THEN 'BR' ELSE 'EG' END "
+                          "WHERE run_id=103 AND article_id IN (SELECT article_id FROM articles WHERE run_id=103 LIMIT 60)")
+            return {"gate_total": 228, "gate_kept": 60}
 
         def cluster(run, report, cancel):
             return {"clusters": 1}
@@ -332,7 +337,7 @@ def test_second_llm_stage_is_gated_against_what_is_left(store):
     spy = _PromptCountingStore(store)
     reg = JobRegistry(spy, factory, pricing=PRICING, stage_models={"gate": "deepseek-v3.2", "cluster": "deepseek-v3.2"},
                       llm_factory=lambda: FakeLLM(3000, 600))
-    job = reg.start("resume_run", 103, ["gate", "cluster"], 0.026, "test", {})
+    job = reg.start("resume_run", 103, ["gate", "cluster"], 0.025, "test", {})
     row = _wait_status(reg, job["job_id"], ("input_required", "completed", "failed"))
     assert row["status"] == "input_required" and row["stage"] == "cluster"
     assert "remaining" in row["input_request"]["message"]

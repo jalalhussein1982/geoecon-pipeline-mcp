@@ -312,10 +312,11 @@ class JobRunner(threading.Thread):
             # queued batches still call complete(); they must fail fast, not ask the operator again.
             self.aborted.set()
             raise BudgetAborted("aborted at budget gate")
-        new_limit = new_budget if new_budget is not None else max(self.budget.limit_usd, est_usd)
-        if new_limit < est_usd:
-            # approving without enough budget: take the estimate as the new ceiling, say so
-            new_limit = est_usd
+        # est_usd is what the next step needs on top of what was already spent
+        needed = self.budget.spent_usd + est_usd
+        new_limit = new_budget if new_budget is not None else max(self.budget.limit_usd, needed)
+        if new_limit < needed:
+            new_limit = needed             # approving below the need would stop the job again at once
         self.budget.limit_usd = float(new_limit)
         self._update(budget_usd=self.budget.limit_usd, input_request=None)
         self._set_status("working")
@@ -329,11 +330,15 @@ class JobRunner(threading.Thread):
         self._ask_budget(msg, spent, requires_number=True)
 
     def _gate_estimate(self, stage: str, run: dict) -> None:
+        """Compare the stage's estimate with what is LEFT of the budget, not with the whole ceiling:
+        the budget is per job and earlier stages have already spent part of it."""
         est = self.reg.estimate(stage, run)
-        if est["usd"] > self.budget.limit_usd:
+        remaining = round(self.budget.limit_usd - self.budget.spent_usd, 6)
+        if est["usd"] > remaining:
             msg = (f"Stage {stage} is estimated at {est['usd']:.4f} USD ({est['tokens_in']} in / {est['tokens_out']} out "
-                   f"tokens on {est['model']}; {est['basis']}), above the budget of {self.budget.limit_usd:.4f} USD. "
-                   f"Approve with new_budget_usd >= {est['usd']:.4f} or abort.")
+                   f"tokens on {est['model']}; {est['basis']}); {remaining:.4f} USD of the {self.budget.limit_usd:.4f} USD "
+                   f"budget is remaining after {self.budget.spent_usd:.4f} USD spent. Approve with new_budget_usd >= "
+                   f"{self.budget.spent_usd + est['usd']:.4f} or abort.")
             self._ask_budget(msg, est["usd"])
 
     # -- main ---------------------------------------------------------------------------------

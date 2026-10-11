@@ -167,6 +167,13 @@ class CountingLLMClient:
                 pass
 
 
+def stage_models_from_config(cfg: Any) -> dict[str, str]:
+    """stage -> model name as the pipeline itself will call them (Config.gate_model, dedup_model
+    for the cluster grouping call, synthesis_model for synthesis and the region summaries)."""
+    return {"gate": cfg.gate_model, "cluster": cfg.dedup_model, "synthesis": cfg.synthesis_model,
+            "summary": cfg.synthesis_model}
+
+
 # ── estimator ───────────────────────────────────────────────────────────────────────
 
 

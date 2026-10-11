@@ -267,7 +267,7 @@ class PostgresStore:
 
 
 def pipeline_factories(settings: Any, store: PostgresStore):
-    """(stage_factory, llm_factory) for operator mode: the pipeline's Config from the same env
+    """(stage_factory, llm_factory, cfg) for operator mode: the pipeline's Config from the same env
     as the CronJob, its LLMClient, and its stage functions on a fresh connection per job."""
     from geoecon.config import Config
     from geoecon.llm.client import LLMClient
@@ -291,7 +291,7 @@ def pipeline_factories(settings: Any, store: PostgresStore):
 
         return {n: wrap(n) for n in names}
 
-    return stage_factory, llm_factory
+    return stage_factory, llm_factory, cfg
 
 
 __all__ = ["PostgresStore", "apply_all_migrations", "pipeline_factories", "MIGRATIONS_DIR"]
