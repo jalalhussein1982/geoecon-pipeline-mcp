@@ -135,3 +135,65 @@ async def test_resume_run_on_a_complete_run_is_refused(client):
     assert r.is_error is True and "nothing to resume" in r.content[0].text
     r = await client.call_tool("start_job", {"kind": "run_stage", "run_id": 103})
     assert r.is_error is True and "'gate'" in r.content[0].text
+
+
+@pytest.mark.anyio
+async def test_a_run_the_cronjob_is_executing_right_now_is_refused(client, app):
+    """Run 104 is `running`; nine hours old it is abandoned and may be resumed, one hour old it is
+    live and must not be touched (point at reconcile_abandoned / wait)."""
+    from datetime import timedelta
+    from geoecon_pipeline_mcp.store import iso
+    fresh = app.store.now() - timedelta(hours=1)
+    app.store.execute("UPDATE runs SET started_at=? WHERE run_id=104", (iso(fresh),))
+    for kind, extra in (("resume_run", {}), ("run_stage", {"stage": "gate"})):
+        r = await client.call_tool("start_job", {"kind": kind, "run_id": 104, **extra})
+        assert r.is_error is True, kind
+        assert "running" in r.content[0].text and "reconcile_abandoned" in r.content[0].text
+    r = await client.call_tool("preview_resume", {"run_id": 104})
+    assert r.is_error is False and "still running" in r.structured_content["message"]
+    app.store.execute("UPDATE runs SET started_at=? WHERE run_id=104", (iso(app.store.now() - timedelta(hours=9)),))
+    h = await call(client, "start_job", kind="run_stage", run_id=104, stage="gate")       # abandoned: allowed
+    assert (await poll(client, h["job_id"]))["status"] == "completed"
+
+
+@pytest.mark.anyio
+async def test_run_is_marked_running_while_a_job_works_on_it(fast_settings, synthetic_db):
+    import threading
+    from mcp import Client
+    from geoecon_pipeline_mcp.server import create_server
+    from geoecon_pipeline_mcp.store import SyntheticStore
+
+    release = threading.Event()
+    store = SyntheticStore(synthetic_db)
+
+    def factory(client):
+        def gate(run, report, cancel):
+            release.wait(10)
+            return {"gate_kept": 1}
+        return {"gate": gate}
+
+    app = create_server(fast_settings, store=store, stage_factory=factory)
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as client:
+            h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate")
+            for _ in range(100):
+                d = await call(client, "run_status", run_id=103)
+                if d["status"] == "running":
+                    break
+                import anyio; await anyio.sleep(0.01)
+            assert d["status"] == "running" and d["active_job_id"] == h["job_id"]
+            release.set()
+            assert (await poll(client, h["job_id"]))["status"] == "completed"
+            assert (await call(client, "run_status", run_id=103))["status"] == "partial"
+    finally:
+        app.close()
+
+
+@pytest.mark.anyio
+async def test_cancelled_job_leaves_the_run_failed_not_running(client, app):
+    h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate", budget_usd=0.001)
+    await poll(client, h["job_id"], until=("input_required",))
+    assert app.store.run_detail(103)["status"] == "running"
+    await call(client, "cancel_job", job_id=h["job_id"])
+    assert (await poll(client, h["job_id"]))["status"] == "cancelled"
+    assert app.store.run_detail(103)["status"] == "failed"

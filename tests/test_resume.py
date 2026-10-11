@@ -98,8 +98,8 @@ def test_default_stage_names_come_from_the_real_orchestrator():
                            "SMTP_PASSWORD": "p", "FROM_ADDR": "f", "RECIPIENTS": "a@b"})
     names = stages.default_stage_names(cfg, client=None)
     assert names == ["discovery", "discovery_registry", "extraction", "gate", "cluster", "synthesis", "summary", "render", "send"]
-    fns = stages.make_pipeline_stage_fns(cfg, repo=None, run={"run_id": 1, "window_end": datetime(2026, 10, 9, tzinfo=timezone.utc)},
-                                         client=None)
+    run = {"run_id": 1, "window_start": datetime(2026, 10, 8, tzinfo=timezone.utc), "window_end": datetime(2026, 10, 9, tzinfo=timezone.utc)}
+    fns = stages.make_pipeline_stage_fns(cfg, repo=None, run=run, client=None)
     assert list(fns) == names                                            # real modules import; nothing executed
 
 
@@ -142,3 +142,22 @@ async def test_resume_run_103_runs_every_remaining_stage_and_stops_before_send(c
     assert cr["estimated_usd"] == pytest.approx(job["usage"]["usd_total"], rel=1e-6)
     held = await call(client, "list_held_records", run_id=103)
     assert isinstance(held["result"], list)
+
+
+def test_real_discovery_in_gkg_mode_fetches_the_original_window(store, monkeypatch):
+    """Upstream discovery.run honours now= only on the docapi path; in the default gkg mode it
+    computes the window from datetime.now(). The wrapper must bind fetch= to the run's window."""
+    from geoecon.config import Config
+    from geoecon.stages import discovery
+
+    seen = []
+    monkeypatch.setattr(discovery, "_default_fetch", lambda ws, we: (seen.append((ws, we)) or []))
+    cfg = Config.from_env({"DB_DSN": "x", "MAETCENTRUM_KEY": "k", "SMTP_HOST": "h", "SMTP_USER": "u",
+                           "SMTP_PASSWORD": "p", "FROM_ADDR": "f", "RECIPIENTS": "a@b"})
+    assert cfg.gdelt_mode == "gkg"
+    run = store.run_detail(103)
+    repo = SimpleNamespace(insert_article=lambda *a, **k: 1)
+    fns = stages.make_pipeline_stage_fns(cfg, repo, run, client=None, names=["discovery"])
+    out = fns["discovery"](run, lambda *a: None, None)
+    assert seen == [(run["window_start"], run["window_end"])]
+    assert out["discovered"] == 0 and out["raw_lines"] == 0

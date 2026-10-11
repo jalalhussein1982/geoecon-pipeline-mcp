@@ -8,8 +8,10 @@ That is what `plan_resume` + `make_pipeline_stage_fns` do, from the outside, wit
 the pipeline.
 
 `make_pipeline_stage_fns` mirrors `geoecon.orchestrator._default_stages` closure for closure,
-with two differences: the discovery stages get `now=run.window_end`, and render/send derive
-their date string from the window instead of today. The set of names is intersected with
+with two differences: the discovery stages get the run's window (`now=run.window_end`; for GDELT
+discovery in the default gkg mode, which ignores `now`, the GKG fetch is bound to
+`(window_start, window_end)` directly), and render/send derive their date string from the window
+instead of today. The set of names is intersected with
 what `_default_stages(cfg, client)` returns at runtime, so `discovery_search` appears only
 when the pipeline is configured for it.
 """
@@ -90,12 +92,20 @@ def make_pipeline_stage_fns(cfg: Any, repo: Any, run: dict, client: Any, *, modu
     counter and the DB counter; cancel is observed by the counting LLM client."""
     m = modules or _default_modules()
     allowed = set(names) if names is not None else set(default_stage_names(cfg, client))
+    window_start: datetime = run["window_start"]
     window_end: datetime = run["window_end"]
     date_str = window_end.strftime("%Y-%m-%d")
     rid = run["run_id"]
 
     def discovery(run_, report, cancel):
-        return m.discovery.run(cfg, repo, rid, now=window_end)
+        # Upstream discovery.run honours now= only on the docapi path; in the default gkg mode it
+        # takes datetime.now() and hands that window to fetch(window_start, window_end). Binding
+        # fetch= to the run's own window is the only way to give gkg discovery the original window.
+        kwargs: dict[str, Any] = {"now": window_end}
+        default_fetch = getattr(m.discovery, "_default_fetch", None)
+        if default_fetch is not None:
+            kwargs["fetch"] = lambda _ws, _we: default_fetch(window_start, window_end)
+        return m.discovery.run(cfg, repo, rid, **kwargs)
 
     def discovery_registry(run_, report, cancel):
         return m.discovery_registry.run(cfg, repo, rid, now=window_end)
