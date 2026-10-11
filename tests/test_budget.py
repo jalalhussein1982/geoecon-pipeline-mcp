@@ -225,3 +225,139 @@ def test_budget_approve_under_fanout_asks_once_per_overspend_not_per_worker(stor
     assert row["status"] == "completed" and row["result"]["gate"]["gate_total"] == 10
     assert spy.prompts == 1
     reg.shutdown()
+
+
+# ── handshake races (finding 7) ───────────────────────────────────────────────────────
+
+
+def _runner(store, budget=1.0):
+    from geoecon_pipeline_mcp.jobs import JobRegistry, JobRunner
+    reg = JobRegistry(store, lambda c: {}, pricing=PRICING, stage_models={}, llm_factory=FakeLLM)
+    job = {"job_id": "11111111-1111-1111-1111-111111111111", "kind": "run_stage", "run_id": 103, "stages_planned": ["gate"],
+           "budget_usd": budget, "status": "working"}
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    store.job_insert({**job, "created_at": now, "updated_at": now})
+    return reg, JobRunner(reg, job)
+
+
+def test_cancel_that_lands_before_the_wait_is_not_lost(store):
+    """request_cancel sets cancel+decision; _ask_budget then clears decision. Without a re-check
+    the worker would block forever on a wake-up that already happened."""
+    from geoecon_pipeline_mcp.jobs import JobCancelled
+    reg, runner = _runner(store)
+    runner.request_cancel()
+    outcome = []
+
+    def go():
+        try:
+            runner._ask_budget("m", 1.0)
+        except BaseException as e:  # noqa: BLE001
+            outcome.append(type(e).__name__)
+
+    t = threading.Thread(target=go, daemon=True); t.start(); t.join(2.0)
+    assert not t.is_alive(), "worker blocked on a lost wake-up"
+    assert outcome == ["JobCancelled"]
+
+
+def test_a_second_answer_is_refused(store):
+    from geoecon_pipeline_mcp.jobs import NotWaiting
+    reg, runner = _runner(store)
+    reg._runners[runner.job_id] = runner
+    gate_open = threading.Event()
+    result = []
+
+    def go():
+        try:
+            runner._ask_budget("m", 0.5); result.append("resumed")
+        except BaseException as e:  # noqa: BLE001
+            result.append(type(e).__name__)
+
+    t = threading.Thread(target=go, daemon=True); t.start()
+    deadline = threading.Event()
+    for _ in range(200):
+        if reg.get(runner.job_id)["status"] == "input_required":
+            break
+        threading.Event().wait(0.01)
+    assert runner.deliver_answer(True, 2.0) is True
+    assert runner.deliver_answer(False, None) is False            # slot already consumed
+    t.join(2.0)
+    assert result == ["resumed"] and runner.budget.limit_usd == 2.0
+
+
+# ── runtime approval needs a number (finding 5) ───────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_runtime_overspend_approval_without_a_number_is_refused(synthetic_db):
+    from mcp import Client
+    from geoecon_pipeline_mcp.server import Settings, create_server
+
+    settings = Settings(mode="synthetic", synthetic_db=synthetic_db, fake_unit_sleep=0.0,
+                        fake_prompt_tokens=300_000, fake_completion_tokens=60_000)
+    app = create_server(settings)
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as client:
+            est = (await call(client, "preview_resume", run_id=103))["estimates"][0]
+            h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate", budget_usd=round(est["usd"] * 2, 4))
+            job = await poll(client, h["job_id"], until=("input_required", "completed", "failed"))
+            assert job["status"] == "input_required" and job["input_request"]["requires_new_budget_usd"] is True
+            r = await client.call_tool("answer_job", {"job_id": h["job_id"], "approve": True})
+            assert r.is_error is True and "new_budget_usd" in r.content[0].text
+            assert (await call(client, "job_status", job_id=h["job_id"]))["status"] == "input_required"   # still waiting
+            await call(client, "answer_job", job_id=h["job_id"], approve=True, new_budget_usd=50.0)
+            assert (await poll(client, h["job_id"], timeout=30))["status"] == "completed"
+    finally:
+        app.close()
+
+
+# ── estimate against the remaining budget, models from the pipeline config (finding 10) ──
+
+
+def test_second_llm_stage_is_gated_against_what_is_left(store):
+    """Budget 0.026: gate's estimate (0.0235) fits and the fake gate spends exactly that, leaving
+    0.0025; cluster's estimate (0.0037) must now prompt even though it is far below the total."""
+    from geoecon_pipeline_mcp.jobs import JobRegistry
+
+    def factory(client):
+        def gate(run, report, cancel):
+            for _ in range(16):
+                client.complete("deepseek-v3.2", [])
+            return {"gate_total": 240}
+
+        def cluster(run, report, cancel):
+            return {"clusters": 1}
+        return {"gate": gate, "cluster": cluster}
+
+    spy = _PromptCountingStore(store)
+    reg = JobRegistry(spy, factory, pricing=PRICING, stage_models={"gate": "deepseek-v3.2", "cluster": "deepseek-v3.2"},
+                      llm_factory=lambda: FakeLLM(3000, 600))
+    job = reg.start("resume_run", 103, ["gate", "cluster"], 0.026, "test", {})
+    row = _wait_status(reg, job["job_id"], ("input_required", "completed", "failed"))
+    assert row["status"] == "input_required" and row["stage"] == "cluster"
+    assert "remaining" in row["input_request"]["message"]
+    reg.answer(job["job_id"], True, 1.0)
+    assert _wait_status(reg, job["job_id"], ("completed", "failed"))["status"] == "completed"
+    reg.shutdown()
+
+
+def test_stage_models_come_from_the_pipeline_config():
+    from geoecon.config import Config
+    from geoecon_pipeline_mcp.cost import stage_models_from_config
+    cfg = Config.from_env({"DB_DSN": "x", "MAETCENTRUM_KEY": "k", "SMTP_HOST": "h", "SMTP_USER": "u", "SMTP_PASSWORD": "p",
+                           "FROM_ADDR": "f", "RECIPIENTS": "a@b", "GATE_MODEL": "gemma4", "DEDUP_MODEL": "kimi",
+                           "SYNTHESIS_MODEL": "deepseek"})
+    assert stage_models_from_config(cfg) == {"gate": "gemma4", "cluster": "kimi", "synthesis": "deepseek", "summary": "deepseek"}
+
+
+# ── usage snapshot (finding 9) ────────────────────────────────────────────────────────
+
+
+def test_on_usage_receives_a_snapshot_taken_under_the_lock():
+    seen = []
+    c = cost.CountingLLMClient(FakeLLM(), PRICING, cost.Budget(10), cost.empty_usage(), on_usage=lambda snap: seen.append(snap))
+    c.set_stage("gate")
+    c.complete("deepseek-v3.2", [])
+    assert len(seen) == 1 and seen[0] is not c.usage and seen[0] == c.usage
+    seen[0]["stages"]["gate"]["deepseek-v3.2"]["calls"] = 99
+    assert c.usage["stages"]["gate"]["deepseek-v3.2"]["calls"] == 1              # a deep copy, not a view

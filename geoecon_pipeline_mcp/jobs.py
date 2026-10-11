@@ -196,7 +196,8 @@ class JobRegistry:
         runner = self._runners.get(job_id)
         if runner is None:
             raise NotWaiting("job is no longer running in this process (server restarted)")
-        runner.deliver_answer(approve, new_budget_usd)
+        if not runner.deliver_answer(approve, new_budget_usd):
+            raise NotWaiting("job already received an answer; wait for job_status to leave input_required")
         # give the worker a moment to leave input_required so the caller sees the new state
         import time
         for _ in range(50):
@@ -229,6 +230,8 @@ class JobRunner(threading.Thread):
         self.aborted = threading.Event()      # sticky: once the operator aborts, every later LLM call raises
         self._decision = threading.Event()
         self._answer: tuple[bool, float | None] | None = None
+        self._awaiting = False                # True only between parking in input_required and consuming the answer
+        self._answer_lock = threading.Lock()
         self.result: dict[str, Any] = {}
         self.usage = C.empty_usage()
         self._stage: str | None = None
@@ -239,9 +242,16 @@ class JobRunner(threading.Thread):
         self.cancel.set()
         self._decision.set()          # wake a budget wait; it will see the cancel flag
 
-    def deliver_answer(self, approve: bool, new_budget_usd: float | None) -> None:
-        self._answer = (approve, new_budget_usd)
+    def deliver_answer(self, approve: bool, new_budget_usd: float | None) -> bool:
+        """Hand the waiting worker its answer. Exactly one answer is accepted per question;
+        returns False when nothing is waiting or the slot was already filled."""
+        with self._answer_lock:
+            if not self._awaiting or self._answer is not None:
+                return False
+            self._answer = (approve, new_budget_usd)
+            self._awaiting = False
         self._decision.set()
+        return True
 
     # -- helpers -----------------------------------------------------------------------------
 
@@ -273,13 +283,22 @@ class JobRunner(threading.Thread):
         if self.aborted.is_set():
             raise BudgetAborted("aborted at budget gate")
         req = {"key": "budget", "message": message, "requested_schema": BUDGET_SCHEMA}
-        self._decision.clear()
-        self._answer = None
+        with self._answer_lock:
+            self._decision.clear()
+            self._answer = None
+            self._awaiting = True
+        if self.cancel.is_set():
+            # a cancel that landed before the clear() above already consumed its wake-up
+            self._awaiting = False
+            raise JobCancelled("cancelled via MCP")
         self._set_status("input_required", input_request=req)
         self._decision.wait()
-        if self.cancel.is_set() and self._answer is None:
+        with self._answer_lock:
+            self._awaiting = False
+            answer = self._answer
+        if answer is None:
             raise JobCancelled("cancelled via MCP")
-        approve, new_budget = self._answer or (False, None)
+        approve, new_budget = answer
         self._update(input_response={"approve": approve, "new_budget_usd": new_budget})
         if not approve:
             # Sticky. The upstream gate/synth stages fan LLM calls over a ThreadPoolExecutor inside a
