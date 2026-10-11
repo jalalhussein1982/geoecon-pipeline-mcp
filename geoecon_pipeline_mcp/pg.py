@@ -267,6 +267,10 @@ class PostgresStore:
         if job_ids:
             self._exec(Q.JOB_HEARTBEAT, (now, [str(j) for j in job_ids]))
 
+    def jobs_purge_expired(self, now: datetime) -> int:
+        with self._lock:
+            return self.conn.execute(Q.JOBS_PURGE_EXPIRED, (now,)).rowcount
+
     def jobs_working(self) -> list[dict]:
         return [self._job_row(r) for r in self._rows(Q.JOBS_WORKING)]
 
@@ -275,6 +279,21 @@ class PostgresStore:
 
 
 # ── operator-mode factories ────────────────────────────────────────────────────────────
+
+
+class StageSet(dict):
+    """The stage functions of one job plus the database connection they write through. The job
+    runner calls close() when the job ends, whatever way it ends."""
+
+    def __init__(self, fns: dict, conn: psycopg.Connection):
+        super().__init__(fns)
+        self._conn = conn
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001 — closing a dead connection is not an error worth a job
+            pass
 
 
 def pipeline_factories(settings: Any, store: PostgresStore):
@@ -300,9 +319,9 @@ def pipeline_factories(settings: Any, store: PostgresStore):
                 return make_pipeline_stage_fns(cfg, repo, run, client, names=names)[name](run, report, cancel)
             return fn
 
-        return {n: wrap(n) for n in names}
+        return StageSet({n: wrap(n) for n in names}, conn)
 
     return stage_factory, llm_factory, cfg
 
 
-__all__ = ["PostgresStore", "apply_all_migrations", "pipeline_factories", "MIGRATIONS_DIR"]
+__all__ = ["PostgresStore", "StageSet", "apply_all_migrations", "pipeline_factories", "MIGRATIONS_DIR"]

@@ -114,6 +114,7 @@ class JobRegistry:
         self._stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self.recovered = self.recover_after_restart()
+        self.purged = self.purge_expired()
 
     # -- hooks --------------------------------------------------------------------------
 
@@ -151,6 +152,16 @@ class JobRegistry:
                 n += 1
         if n:
             log.warning("marked %d job(s) failed after restart", n)
+        return n
+
+    def purge_expired(self) -> int:
+        try:
+            n = self.store.jobs_purge_expired(_now())
+        except Exception:  # noqa: BLE001 — housekeeping must not stop the server from starting
+            log.warning("could not purge expired jobs", exc_info=True)
+            return 0
+        if n:
+            log.info("purged %d expired job row(s)", n)
         return n
 
     def _ensure_heartbeat(self) -> None:
@@ -394,6 +405,7 @@ class JobRunner(threading.Thread):
     # -- main ---------------------------------------------------------------------------------
 
     def run(self) -> None:  # noqa: C901 — the state machine is clearer in one place
+        fns: Any = None
         try:
             if self.kind == "reconcile_abandoned":
                 self._reconcile()
@@ -479,6 +491,12 @@ class JobRunner(threading.Thread):
             except Exception:  # noqa: BLE001
                 pass
         finally:
+            close = getattr(fns, "close", None)
+            if callable(close):
+                try:
+                    close()                 # operator mode: the job's own database connection
+                except Exception:  # noqa: BLE001
+                    log.warning("job %s: closing the stage set failed", self.job_id, exc_info=True)
             self.reg._runners.pop(self.job_id, None)
 
     def _finalize_run(self, run: dict) -> None:

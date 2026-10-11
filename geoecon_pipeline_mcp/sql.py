@@ -139,6 +139,11 @@ JOB_INSERT = f"""
 INSERT INTO mcp_jobs({', '.join(JOB_COLUMNS)})
 VALUES (%s::uuid, {', '.join(['%s'] * (len(JOB_COLUMNS) - 1))})
 """
+# params: (now,)
+JOBS_PURGE_EXPIRED = """
+DELETE FROM mcp_jobs
+WHERE ttl_expires_at IS NOT NULL AND ttl_expires_at < %s AND status IN ('completed','failed','cancelled')
+"""
 JOB_GET = f"SELECT {', '.join(JOB_COLUMNS)} FROM mcp_jobs WHERE job_id = %s::uuid"
 JOBS_WORKING = f"SELECT {', '.join(JOB_COLUMNS)} FROM mcp_jobs WHERE status IN ('working','input_required') ORDER BY created_at"
 JOBS_FOR_RUN = f"SELECT {', '.join(JOB_COLUMNS)} FROM mcp_jobs WHERE run_id = %s ORDER BY created_at"

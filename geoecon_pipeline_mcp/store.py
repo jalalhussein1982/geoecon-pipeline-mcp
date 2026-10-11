@@ -70,6 +70,7 @@ class Store(Protocol):
     def job_update(self, job_id: str, **fields: Any) -> None: ...
     def job_fail_if_active(self, job_id: str, error: str) -> bool: ...
     def job_heartbeat(self, job_ids: list[str], now: datetime) -> None: ...
+    def jobs_purge_expired(self, now: datetime) -> int: ...
     def jobs_working(self) -> list[dict]: ...
     def jobs_for_run(self, run_id: int) -> list[dict]: ...
 
@@ -512,6 +513,11 @@ class SyntheticStore:
         marks = ",".join("?" * len(job_ids))
         self._x(f"UPDATE mcp_jobs SET heartbeat_at=? WHERE job_id IN ({marks}) AND status IN ('working','input_required')",
                 (iso(now), *job_ids))
+
+    def jobs_purge_expired(self, now: datetime) -> int:
+        """Delete terminal rows past their TTL. Returns the number removed."""
+        return self._x("DELETE FROM mcp_jobs WHERE ttl_expires_at IS NOT NULL AND ttl_expires_at < ? "
+                       "AND status IN ('completed','failed','cancelled')", (iso(now),))
 
     def jobs_working(self) -> list[dict]:
         return [self._job_row(r) for r in
