@@ -193,6 +193,7 @@ class InputRequest(BaseModel):
     key: str = Field(description="`budget` for the cost gate.")
     message: str
     requested_schema: dict[str, Any] = Field(description="JSON Schema of the answer `answer_job` expects.")
+    requires_new_budget_usd: bool = Field(default=False, description="True for a runtime overspend: approving needs an explicit new ceiling.")
 
 
 class JobHandle(BaseModel):

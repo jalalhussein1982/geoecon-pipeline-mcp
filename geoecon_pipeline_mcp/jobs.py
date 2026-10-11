@@ -196,6 +196,9 @@ class JobRegistry:
         runner = self._runners.get(job_id)
         if runner is None:
             raise NotWaiting("job is no longer running in this process (server restarted)")
+        if approve and new_budget_usd is None and (row.get("input_request") or {}).get("requires_new_budget_usd"):
+            raise NotWaiting("this question is about actual spend above the ceiling; approving needs an explicit "
+                             "new_budget_usd (without one the job would stop again after a single call)")
         if not runner.deliver_answer(approve, new_budget_usd):
             raise NotWaiting("job already received an answer; wait for job_status to leave input_required")
         # give the worker a moment to leave input_required so the caller sees the new state
@@ -278,11 +281,14 @@ class JobRunner(threading.Thread):
 
     # -- budget gate -------------------------------------------------------------------------
 
-    def _ask_budget(self, message: str, est_usd: float) -> None:
-        """Block the worker until answer_job or cancel_job. Raises BudgetAborted / JobCancelled."""
+    def _ask_budget(self, message: str, est_usd: float, *, requires_number: bool = False) -> None:
+        """Block the worker until answer_job or cancel_job. Raises BudgetAborted / JobCancelled.
+        `requires_number`: a runtime overspend has no estimate to fall back on, so approving
+        without new_budget_usd is refused by JobRegistry.answer (it would buy one more call)."""
         if self.aborted.is_set():
             raise BudgetAborted("aborted at budget gate")
-        req = {"key": "budget", "message": message, "requested_schema": BUDGET_SCHEMA}
+        req = {"key": "budget", "message": message, "requested_schema": BUDGET_SCHEMA,
+               "requires_new_budget_usd": requires_number}
         with self._answer_lock:
             self._decision.clear()
             self._answer = None
@@ -319,8 +325,8 @@ class JobRunner(threading.Thread):
         if self.cancel.is_set():
             raise JobCancelled("cancelled via MCP")
         msg = (f"Stage {self._stage}: spent {spent:.4f} USD so far, above the approved ceiling of "
-               f"{self.budget.limit_usd:.4f} USD. Approve a higher new_budget_usd to continue or abort.")
-        self._ask_budget(msg, spent)
+               f"{self.budget.limit_usd:.4f} USD. Approve with an explicit higher new_budget_usd to continue, or abort.")
+        self._ask_budget(msg, spent, requires_number=True)
 
     def _gate_estimate(self, stage: str, run: dict) -> None:
         est = self.reg.estimate(stage, run)
