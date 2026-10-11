@@ -267,6 +267,13 @@ class JobRunner(threading.Thread):
             fields.setdefault("finished_at", now)
             fields.setdefault("ttl_expires_at", now + JOB_TTL)
             fields.setdefault("input_request", None)
+            if status in ("failed", "cancelled") and self.run_id is not None and self.kind != "reconcile_abandoned":
+                # the run was marked `running` for this job; it must not stay that way
+                try:
+                    self.store.set_run_status(self.run_id, "failed")
+                    self.reg.notify(f"run://{self.run_id}")
+                except Exception:  # noqa: BLE001 — the job row must still end terminal
+                    log.exception("job %s: could not settle run %s", self.job_id, self.run_id)
         self._update(status=status, **fields)
         self.reg.notify(f"job://{self.job_id}")
 
@@ -349,6 +356,9 @@ class JobRunner(threading.Thread):
                 self._reconcile()
                 return
             run = self._run_dict()
+            # the run belongs to this job now: anyone reading the table sees it as running
+            self.store.set_run_status(self.run_id, "running")
+            self.reg.notify(f"run://{self.run_id}")
             inner = self.reg.llm_factory()
             client = C.CountingLLMClient(inner, self.reg.pricing, self.budget, self.usage,
                                          on_exceeded=self._on_budget_exceeded, cancel=self.cancel,

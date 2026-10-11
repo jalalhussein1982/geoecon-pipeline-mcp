@@ -59,7 +59,7 @@ from . import incidents as I
 from . import models as M
 from .jobs import TERMINAL, JobConflict, JobRegistry, NotWaiting, UnknownJob
 from .stages import plan_resume
-from .store import CANONICAL_STAGES, LLM_STAGES, Store, SyntheticStore
+from .store import CANONICAL_STAGES, LLM_STAGES, STALE_AFTER, Store, SyntheticStore
 from .synth import FIXTURES_DIR, SOURCES_PATH, FakeLLM, make_fake_stages
 
 log = logging.getLogger("geoecon_pipeline_mcp.server")
@@ -505,6 +505,7 @@ def register_tools(app: App) -> None:
             if run_id is None:
                 raise ToolError(f"{kind} needs run_id. Call list_runs to pick one.")
             d = app.run(run_id)
+            _refuse_if_live(app, d)
             if kind == "run_stage":
                 stages = [_validate_stage(app, d, stage, force)]
             else:
@@ -585,6 +586,10 @@ def register_tools(app: App) -> None:
         first_over = next((e for e in estimates if e.usd > budget), None)
         if plan.nothing_to_resume:
             msg = f"Run {run_id} has nothing to resume: every stage is completed (status={d['status']})."
+        elif _is_live(app, d):
+            msg = (f"Run {run_id} is still running (started {_age_text(app, d)} ago): another process is executing "
+                   f"it, so start_job would refuse. Wait, or once it is older than {int(STALE_AFTER.total_seconds() // 3600)} h "
+                   f"use start_job(reconcile_abandoned) and then resume {', '.join(plan.remaining)}.")
         else:
             msg = (f"start_job(resume_run, {run_id}) would run {', '.join(plan.remaining)} with the original window "
                    f"{plan.window_start:%Y-%m-%d %H:%M}Z -> {plan.window_end:%Y-%m-%d %H:%M}Z; estimated "
@@ -652,6 +657,27 @@ def _validate_stage(app: App, d: dict, stage: str | None, force: bool) -> str:
     if stage == "send":
         _send_guard(app)
     return stage
+
+
+def _age_text(app: App, d: dict) -> str:
+    secs = int((app.store.now() - d["started_at"]).total_seconds())
+    return f"{secs // 3600} h {(secs % 3600) // 60} min"
+
+
+def _is_live(app: App, d: dict) -> bool:
+    """A run that is `running` and younger than the stale threshold belongs to a live process
+    (the CronJob) unless one of our own jobs is on it (that case is JobConflict's)."""
+    if d["status"] != "running" or app.registry.active_for_run(d["run_id"]):
+        return False
+    return app.store.now() - d["started_at"] < STALE_AFTER
+
+
+def _refuse_if_live(app: App, d: dict) -> None:
+    if _is_live(app, d):
+        raise ToolError(f"Run {d['run_id']} is still running (started {_age_text(app, d)} ago, less than "
+                        f"{int(STALE_AFTER.total_seconds() // 3600)} h): another process is executing it and two writers "
+                        f"would corrupt its stage table. Wait for it to finish; if it is abandoned, "
+                        f"start_job(reconcile_abandoned) closes it out once it is stale, and the run can then be resumed.")
 
 
 def _send_guard(app: App) -> None:
