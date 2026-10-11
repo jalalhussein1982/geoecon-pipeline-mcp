@@ -6,10 +6,11 @@ Two families:
                SourceHealth, HealthVerdict, CostReport, ResumePreview
 * job side   — JobHandle, Job, Progress, InputRequest, Cancelled, Answered
 
-The job family mirrors the MCP tasks extension's `Task` object one-to-one
-(`job_id` ~ taskId, the five statuses, `poll_after_s` ~ pollIntervalMs, `ttl_s` ~ ttlMs,
-`input_request` ~ inputRequests, `result`/`error` on terminal states) so the server can
-adopt the extension without changing its table.
+The job family maps directly onto the MCP tasks extension's `Task` object (`job_id` ~ taskId,
+the same five statuses, `poll_after_s` ~ pollInterval, `ttl_s` ~ ttl, `result`/`error` on
+terminal states). `input_request` is this server's own elicitation shape for the budget
+question (key, message, JSON Schema), not the extension's `inputRequests` wire format; the
+adapter would translate it. The table needs no change to adopt the extension.
 """
 
 from __future__ import annotations
@@ -215,7 +216,7 @@ class Job(BaseModel):
     stages_completed: list[str]
     progress: Progress | None
     poll_after_s: float
-    ttl_s: int | None = Field(description="Seconds until a terminal job's row expires; None while working.")
+    ttl_s: int | None = Field(description="Seconds until the row expires: the remaining TTL of a terminal job, or the TTL that will apply once it ends.")
     started_at: datetime
     updated_at: datetime
     finished_at: datetime | None

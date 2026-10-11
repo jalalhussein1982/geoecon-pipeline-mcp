@@ -17,8 +17,8 @@ def test_run_103_resumes_at_gate_with_everything_after(store):
     assert plan.remaining == ["gate", "cluster", "synthesis", "summary", "render"]        # Review Focus 1
     assert plan.send_withheld is True
     assert plan.skipped_completed == ["discovery", "discovery_registry", "extraction"]
-    assert plan.window_end - plan.window_start == plan.window_end - plan.window_start      # original window kept
-    assert plan.window_end == datetime(2026, 10, 9, 23, 0, tzinfo=timezone.utc)
+    assert plan.window_end == datetime(2026, 10, 9, 23, 0, tzinfo=timezone.utc)             # the run's own window,
+    assert plan.window_start == datetime(2026, 10, 8, 23, 0, tzinfo=timezone.utc)           # not today's
 
 
 def test_run_101_has_nothing_to_resume(store):

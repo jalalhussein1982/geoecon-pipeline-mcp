@@ -53,9 +53,13 @@ async def test_two_stage_job_notifies_on_every_status_change(client):
 
 
 @pytest.mark.anyio
-async def test_unrelated_uris_are_not_delivered(client):
-    async with client.listen(resource_subscriptions=["run://101"]) as sub:
+async def test_only_subscribed_uris_are_delivered(client):
+    """Positive control and negative case on one stream: a job on run 105 must produce run://105
+    events (bounded wait, fail if absent) and no run://101 event, although 101 is subscribed too."""
+    async with client.listen(resource_subscriptions=["run://101", "run://105"]) as sub:
         h = await call(client, "start_job", kind="run_stage", run_id=105, stage="render", force=True)
-        await poll(client, h["job_id"])
-        events = await _collect(sub, 1, timeout=0.5)
-    assert events == []
+        events = await _collect(sub, 2, timeout=10)
+        job = await poll(client, h["job_id"])
+        assert job["status"] == "completed"
+    assert len(events) >= 2, "expected run://105 events within the timeout"
+    assert {e.uri for e in events} == {"run://105"}

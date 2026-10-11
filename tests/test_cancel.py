@@ -95,13 +95,41 @@ def test_cancel_is_idempotent_on_terminal_jobs(store):
 
 
 @pytest.mark.anyio
-async def test_cancel_job_tool(client, app):
-    h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate")
-    c = await call(client, "cancel_job", job_id=h["job_id"])
-    assert c["status"] in ("working", "cancelled")
-    job = await poll(client, h["job_id"])
-    assert job["status"] in ("cancelled", "completed")           # a very fast stage may finish first
-    again = await call(client, "cancel_job", job_id=h["job_id"])
-    assert again["status"] == job["status"] and "nothing to cancel" in again["message"]
-    r = await client.call_tool("cancel_job", {"job_id": "nope"})
-    assert r.is_error is True
+async def test_cancel_job_tool(fast_settings, synthetic_db):
+    """Deterministic: the stage blocks on an event until the cancel has been requested, then
+    observes the flag and raises, so the job must end cancelled."""
+    from mcp import Client
+    from geoecon_pipeline_mcp.server import create_server
+    from geoecon_pipeline_mcp.store import SyntheticStore
+    from geoecon_pipeline_mcp.synth import StageCancelled
+
+    entered, release = threading.Event(), threading.Event()
+    store = SyntheticStore(synthetic_db)
+
+    def factory(c):
+        def gate(run, report, cancel):
+            entered.set()
+            release.wait(10)
+            if cancel.is_set():
+                raise StageCancelled("cancelled via MCP")
+            return {"gate_kept": 1}
+        return {"gate": gate}
+
+    app = create_server(fast_settings, store=store, stage_factory=factory)
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as client:
+            h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate")
+            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            c = await call(client, "cancel_job", job_id=h["job_id"])
+            assert c["status"] == "working" and "cancel requested" in c["message"]
+            release.set()
+            job = await poll(client, h["job_id"])
+            assert job["status"] == "cancelled" and job["error"] == "cancelled via MCP"
+            gate = next(s for s in store.run_detail(103)["stages"] if s["stage_name"] == "gate")
+            assert gate["status"] == "failed" and gate["error"] == "cancelled via MCP"
+            again = await call(client, "cancel_job", job_id=h["job_id"])
+            assert again["status"] == "cancelled" and "nothing to cancel" in again["message"]
+            r = await client.call_tool("cancel_job", {"job_id": "nope"})
+            assert r.is_error is True
+    finally:
+        app.close()

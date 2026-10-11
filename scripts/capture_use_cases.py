@@ -109,9 +109,18 @@ async def main() -> None:
             doc.call("start_job", {"kind": "reconcile_abandoned"}, trim(h, ["job_id", "status", "stages_planned", "poll_after_s"]))
             doc.call("job_status", {"job_id": "<job_id>"}, trim(job, ["status", "result"]))
 
+    finally:
+        app.close()
+
+    # scenarios 2-3 start from a fresh copy: scenario 1's reconciliation closed run 104 at the
+    # wall clock, and mixing that into a fixture-clock history would mislead the reader
+    build_synthetic(TMP).close()
+    app = create_server(Settings(mode="synthetic", synthetic_db=TMP, fake_unit_sleep=0.01))
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as c:
             # 2 ------------------------------------------------------------------
             doc.h(2, "2. Read why run 103 failed")
-            doc.p("**Host prompt:** *\"Why did last Thursday's run fail?\"*")
+            doc.p("**Host prompt:** *\"Why did last Thursday's run fail?\"* (fresh copy of the history)")
             runs = await tool(c, "list_runs", status="failed")
             doc.call("list_runs", {"status": "failed"}, runs)
             e = await tool(c, "failed_stage_error", run_id=103)

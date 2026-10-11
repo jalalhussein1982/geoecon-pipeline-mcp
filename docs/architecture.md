@@ -94,7 +94,9 @@ completed stages, and starts at the first stage that is not completed — a `fai
 `pipeline:send`.
 
 `make_pipeline_stage_fns` rebuilds the orchestrator's closures with two changes: the three
-discovery stages get `now=run.window_end` (so the window is the run's own, not today's) and
+discovery stages get the run's window — `now=run.window_end` for registry and search discovery and
+for GDELT's docapi path, and for GDELT in the default gkg mode (which ignores `now=` and reads
+`datetime.now()`) the GKG `fetch` is bound to `(window_start, window_end)` directly — and
 render/send derive their date string from that window. The orchestrator's own
 `find_resumable_run` keys on `window_end = now` and never matches; this is the fix from the
 outside.
@@ -157,7 +159,7 @@ build) and every error text in it is invented.
 |---|---|
 | `tasks/create` (a tool call with task metadata) → `CreateTaskResult{taskId, status, pollInterval, ttl}` | `start_job` → `JobHandle{job_id, status, poll_after_s}`; `ttl_s` on the Job |
 | `tasks/get` → `Task{status, statusMessage, pollInterval, ttl}` | `job_status` → `Job` with the same five statuses, `progress`, `poll_after_s`, `ttl_s` |
-| `input_required` with `inputRequests` | `Job.input_request{key, message, requested_schema}` |
+| `input_required` with `inputRequests` | `Job.input_request{key, message, requested_schema, requires_new_budget_usd}` — our own elicitation shape; an adapter translates it |
 | `tasks/update` (answer) | `answer_job` |
 | `tasks/cancel` | `cancel_job` |
 | `tasks/result` | `Job.result` / `Job.error` on terminal rows |

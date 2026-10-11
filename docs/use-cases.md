@@ -75,7 +75,7 @@ Two facts, both from the pipeline's own watchdog logic plus the stale-run count 
 
 ```json
 {
-  "job_id": "38824b4f-0efb-4fbd-8aa4-c56418942a30",
+  "job_id": "ef31eb30-847e-4718-a229-f94b13f282d4",
   "status": "working",
   "stages_planned": [],
   "poll_after_s": 2.0
@@ -99,24 +99,13 @@ Two facts, both from the pipeline's own watchdog logic plus the stale-run count 
 
 ## 2. Read why run 103 failed
 
-**Host prompt:** *"Why did last Thursday's run fail?"*
+**Host prompt:** *"Why did last Thursday's run fail?"* (fresh copy of the history)
 
 **Tool call** `list_runs(status="failed")`
 
 ```json
 {
   "result": [
-    {
-      "run_id": 104,
-      "window_start": "2026-10-09T23:00:00Z",
-      "window_end": "2026-10-10T23:00:00Z",
-      "status": "failed",
-      "started_at": "2026-10-10T23:00:02Z",
-      "finished_at": "2026-10-11T00:09:18.897697Z",
-      "stages_done": 3,
-      "stages_total": 9,
-      "last_failed_stage": "gate"
-    },
     {
       "run_id": 103,
       "window_start": "2026-10-08T23:00:00Z",
@@ -260,7 +249,7 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
 
 ```json
 {
-  "job_id": "0778b1af-9f5d-4305-b21a-48a33d118001",
+  "job_id": "70353814-5d31-42a4-82ea-673cda9f5c60",
   "status": "working",
   "poll_after_s": 2.0,
   "stages_planned": [
@@ -295,9 +284,9 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
     "status": "working",
     "stage": "cluster",
     "progress": {
-      "done": 12,
+      "done": 10,
       "total": 18,
-      "message": "country KU"
+      "message": "country IS"
     },
     "stages_completed": [
       "gate"
@@ -307,9 +296,9 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
     "status": "working",
     "stage": "synthesis",
     "progress": {
-      "done": 18,
+      "done": 16,
       "total": 34,
-      "message": "cluster 18/34"
+      "message": "cluster 16/34"
     },
     "stages_completed": [
       "gate",
@@ -504,7 +493,7 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
   ],
   "pricing_as_of": "2026-10-11",
   "jobs_counted": [
-    "0778b1af-9f5d-4305-b21a-48a33d118001"
+    "70353814-5d31-42a4-82ea-673cda9f5c60"
   ]
 }
 ```
@@ -520,7 +509,7 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
 
 ```json
 {
-  "job_id": "3e8dd737-f5eb-4618-8225-d7865adc5d5b",
+  "job_id": "75d37e23-c4b2-4e26-bcf6-75c4dce94273",
   "status": "working",
   "poll_after_s": 2.0,
   "stages_planned": [
@@ -540,7 +529,7 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
   "budget_usd": 0.01,
   "input_request": {
     "key": "budget",
-    "message": "Stage gate is estimated at 0.0235 USD (48000 in / 9600 out tokens on deepseek-v3.2; 228 non-failed articles in 16 batches of 15 x 3000/600 tokens; the gate re-judges every article), above the budget of 0.0100 USD. Approve with new_budget_usd >= 0.0235 or abort.",
+    "message": "Stage gate is estimated at 0.0235 USD (48000 in / 9600 out tokens on deepseek-v3.2; 228 non-failed articles in 16 batches of 15 x 3000/600 tokens; the gate re-judges every article); 0.0100 USD of the 0.0100 USD budget is remaining after 0.0000 USD spent. Approve with new_budget_usd >= 0.0235 or abort.",
     "requested_schema": {
       "type": "object",
       "properties": {
@@ -557,7 +546,8 @@ The plan starts at `gate` (the failed stage is re-run, not skipped), passes the 
       "required": [
         "approve"
       ]
-    }
+    },
+    "requires_new_budget_usd": false
   }
 }
 ```
@@ -568,7 +558,7 @@ The job is parked in `input_required` with a form-shaped request (the tasks exte
 
 ```json
 {
-  "job_id": "3e8dd737-f5eb-4618-8225-d7865adc5d5b",
+  "job_id": "75d37e23-c4b2-4e26-bcf6-75c4dce94273",
   "status": "working",
   "accepted": true,
   "budget_usd": 1.0,

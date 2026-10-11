@@ -59,7 +59,7 @@ from . import incidents as I
 from . import models as M
 from .jobs import TERMINAL, JobConflict, JobRegistry, NotWaiting, UnknownJob
 from .stages import plan_resume
-from .store import CANONICAL_STAGES, LLM_STAGES, STALE_AFTER, Store, SyntheticStore
+from .store import CANONICAL_STAGES, JOB_TTL, LLM_STAGES, STALE_AFTER, Store, SyntheticStore
 from .synth import FIXTURES_DIR, SOURCES_PATH, FakeLLM, make_fake_stages
 
 log = logging.getLogger("geoecon_pipeline_mcp.server")
@@ -641,7 +641,7 @@ def _job(app: App, job_id: str) -> dict:
 
 def _job_model(app: App, row: dict) -> M.Job:
     terminal = row["status"] in TERMINAL
-    ttl = None
+    ttl = int(JOB_TTL.total_seconds())          # what will apply once the job ends
     if terminal and row.get("ttl_expires_at"):
         ttl = max(0, int((row["ttl_expires_at"] - datetime.now(row["ttl_expires_at"].tzinfo)).total_seconds()))
     result = row.get("result") or None

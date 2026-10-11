@@ -61,16 +61,39 @@ async def test_estimate_above_budget_pauses_with_the_form_schema(client, app):
 
 
 @pytest.mark.anyio
-async def test_approve_resumes_and_completes_with_usage(client, app):
-    h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate", budget_usd=0.01)
-    await poll(client, h["job_id"], until=("input_required",))
-    a = await call(client, "answer_job", job_id=h["job_id"], approve=True, new_budget_usd=1.0)
-    assert a["accepted"] is True and a["budget_usd"] == 1.0 and a["status"] in ("working", "completed")
-    job = await poll(client, h["job_id"])
-    assert job["status"] == "completed" and job["budget_usd"] == 1.0
-    assert job["usage"]["stages"]["gate"]["deepseek-v3.2"]["calls"] >= 15 and job["usage"]["usd_total"] > 0
-    assert job["input_request"] is None
-    assert next(s for s in app.store.run_detail(103)["stages"] if s["stage_name"] == "gate")["status"] == "completed"
+async def test_approve_resumes_and_completes_with_usage(fast_settings, synthetic_db):
+    """Deterministic: the gate blocks on an event after its LLM calls, so the state right after
+    answer_job is observable as `working` before the stage is released to complete."""
+    from mcp import Client
+    from geoecon_pipeline_mcp.server import create_server
+    from geoecon_pipeline_mcp.store import SyntheticStore
+
+    release = threading.Event()
+    store = SyntheticStore(synthetic_db)
+
+    def factory(client):
+        def gate(run, report, cancel):
+            for _ in range(16):
+                client.complete("deepseek-v3.2", [])
+            release.wait(10)
+            return {"gate_total": 240, "gate_kept": 50}
+        return {"gate": gate}
+
+    app = create_server(fast_settings, store=store, stage_factory=factory)
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as client:
+            h = await call(client, "start_job", kind="run_stage", run_id=103, stage="gate", budget_usd=0.01)
+            await poll(client, h["job_id"], until=("input_required",))
+            a = await call(client, "answer_job", job_id=h["job_id"], approve=True, new_budget_usd=1.0)
+            assert a["accepted"] is True and a["budget_usd"] == 1.0 and a["status"] == "working"
+            assert (await call(client, "job_status", job_id=h["job_id"]))["input_request"] is None
+            release.set()
+            job = await poll(client, h["job_id"])
+            assert job["status"] == "completed" and job["budget_usd"] == 1.0
+            assert job["usage"]["stages"]["gate"]["deepseek-v3.2"]["calls"] == 16 and job["usage"]["usd_total"] > 0
+            assert next(s for s in store.run_detail(103)["stages"] if s["stage_name"] == "gate")["status"] == "completed"
+    finally:
+        app.close()
 
 
 @pytest.mark.anyio

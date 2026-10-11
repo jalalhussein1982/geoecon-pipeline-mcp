@@ -18,7 +18,7 @@ transport.
 | **Progress** | `job_status.progress` from the pipeline's own log lines and row counts; `preview_resume`/`source_health` report progress on their own request stream | `progress.py` |
 | **`subscriptions/listen`** change notifications | `ResourceUpdated` on `job://{id}` at every status change and `run://{id}` at every stage boundary, published from the worker thread onto the server's bus | `tests/test_notifications.py` |
 | **Cost gate** | every LLM stage is estimated first; above budget the job parks in `input_required` with a form-shaped request; a counting proxy enforces the ceiling between LLM calls; `answer_job` approves or aborts | `cost.py`, `tests/test_budget.py` |
-| **Tasks-extension readiness** | the `Job` model is the extension's `Task` object one-to-one (five statuses, `poll_after_s`, `ttl_s`, `input_request`, `result`/`error`) | below |
+| **Tasks-extension readiness** | the `Job` model maps directly onto the extension's `Task` object (five statuses, `poll_after_s`, `ttl_s`, `result`/`error`); the budget question is our own elicitation shape an adapter would translate | below |
 | OpenTelemetry context | `traceparent`/`tracestate`/`baggage` from the request `_meta` are stored on the job | `tests/test_prompts_trace.py` |
 | Fixes two production defects from the outside | the dead resume path (`find_resumable_run` never matches) and the missing token ledger, without touching the pipeline | `stages.py`, `cost.py` |
 
@@ -127,7 +127,10 @@ Each transition publishes `ResourceUpdated("job://{id}")`; each stage start/comp
 publishes `ResourceUpdated("run://{run_id}")`. Terminal rows are kept 14 days (`ttl_s`).
 
 A resume starts at the first stage that is not completed — a failed `gate` is re-run, not
-skipped — and passes the run's **original** `window_start`/`window_end` to the stage functions.
+skipped — and passes the run's **original** `window_start`/`window_end` to the stage functions
+(for GDELT discovery in the default gkg mode, which ignores `now=`, the GKG fetch itself is bound
+to that window). A run that is `running` and younger than six hours belongs to a live process and
+is refused; `reconcile_abandoned` closes a stale one first.
 `send` is never in the plan unless `ALLOW_SEND=1` on the server **and** the caller holds
 `pipeline:send`; by default a resumed run stops after `render` and `run_status.notes` says so.
 
@@ -135,11 +138,13 @@ skipped — and passes the run's **original** `window_start`/`window_end` to the
 
 This server does **not** implement the MCP tasks extension (`io.modelcontextprotocol/tasks`,
 SEP-2663). The MCP Python SDK 2.x does not ship it, so jobs are ordinary tools with a
-server-minted handle, which every host supports today. The `Job` model is deliberately the
+server-minted handle, which every host supports today. The `Job` model maps directly onto the
 extension's `Task` object: `job_id` ≈ `taskId`, the same five statuses, `poll_after_s` ≈
-`pollInterval`, `ttl_s` ≈ `ttl`, `input_request` ≈ `inputRequests`, `result`/`error` on terminal
-states. When the SDK ships the extension, `tasks/get`, `tasks/update`, `tasks/cancel` map onto
-`job_status`, `answer_job`, `cancel_job` with no change to the table
+`pollInterval`, `ttl_s` ≈ `ttl`, `result`/`error` on terminal states. The budget question
+(`input_request` with a key, a message and a JSON Schema) is this server's own elicitation shape,
+not the extension's `inputRequests` wire format; an adapter would translate it. When the SDK ships
+the extension, `tasks/get`, `tasks/update`, `tasks/cancel` map onto `job_status`, `answer_job`,
+`cancel_job` with no change to the table
 ([docs/architecture.md](docs/architecture.md#tasks-extension-readiness)).
 
 ## Authorization
@@ -154,7 +159,7 @@ stage, and only with `ALLOW_SEND=1`). Over stdio `STDIO_SCOPES` applies (default
 ## Tests
 
 ```bash
-uv run pytest -q          # 128 passed: 119 in-memory + 9 ephemeral-PostgreSQL (db) tests
+uv run pytest -q          # 151 passed: 142 in-memory + 9 ephemeral-PostgreSQL (db) tests
 make db-test              # only the db tests; they skip cleanly when initdb/pg_ctl are missing
 ```
 

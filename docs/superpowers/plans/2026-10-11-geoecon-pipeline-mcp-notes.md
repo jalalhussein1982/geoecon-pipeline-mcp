@@ -80,7 +80,7 @@ said, what was done, and why.
 
 ## Tests
 
-- 128 tests: 119 in-memory (synthetic store, in-process `Client`, uvicorn HTTP smoke) and 9 `db`
+- 151 tests after the review fixes (128 before): 142 in-memory (synthetic store, in-process `Client`, uvicorn HTTP smoke) and 9 `db`
   tests. The `db` tests start an ephemeral PostgreSQL with `initdb`/`pg_ctl` on a free TCP port
   (Unix sockets disabled: pytest tmp paths exceed the socket path limit on macOS) and skip cleanly
   when the binaries are absent. They ran green here against PostgreSQL 18.4 (Homebrew).
@@ -101,3 +101,27 @@ said, what was done, and why.
   real `geoecon` modules imported but not executed (no LLM, no network).
 - The Docker image was not built here (no registry push in scope).
 - `pricing.yaml` values are placeholders, as the file states.
+
+## Review findings (independent read-only review after the first build)
+
+Each finding was verified against the code (and the upstream `geoecon` package in `.venv`)
+before anything changed. All twelve held; none was rejected. One commit per fix.
+
+| # | Finding | Verdict | Fix |
+|---|---|---|---|
+| 1 | Budget abort did not abort under the upstream `ThreadPoolExecutor` fan-out: queued batches re-prompted once each | **Confirmed** — the regression test hung the worker pool exactly as described | sticky `aborted` Event on the runner; `CountingLLMClient._before_call` raises `BudgetAborted` first; fan-out tests (abort → exactly one prompt → `failed`; approve → one prompt → `completed`) |
+| 2 | `discovery.run` honours `now=` only on the docapi path; gkg mode read `datetime.now()` | **Confirmed** | the wrapper binds `fetch=` to `(window_start, window_end)` when the module exposes `_default_fetch`, so gkg discovery gets the original window too; test drives the real `discovery.run` with a recording fetch. README/architecture wording updated to what is true |
+| 3 | Nothing refused a run the CronJob is executing right now | **Confirmed** | `start_job` refuses a `running` run younger than `STALE_AFTER` (points at `reconcile_abandoned`); `preview_resume` says so; a job marks its run `running` and settles it to `failed` on failure/cancel |
+| 4 | HTTP failed open: partial `AUTH_*` silently unauthenticated; no-token fell back to `STDIO_SCOPES`; `--host 0.0.0.0` with no auth accepted | **Confirmed** (the SDK does 401 once auth is configured, but partial config and no-auth exposure were unguarded) | partial config is a startup `ValueError`; with a verifier configured no token ⇒ no scopes; `main()` refuses `--http` on a non-loopback host without auth unless `--insecure-no-auth`; unauthenticated principal is `local`. `tests/test_http.py` now states the loopback-only semantics |
+| 5 | Runtime "approve" without a number set the ceiling to the spend: one more call | **Confirmed** | runtime questions carry `requires_new_budget_usd`; `answer_job` refuses an approval without one; pre-stage approvals default to `spent + estimate` |
+| 6 | Restart recovery killed live jobs of another process; no-runner `cancel()` could overwrite a completed row | **Confirmed** | `owner_id` + `heartbeat_at` (migration 002, SQLite columns added in place), 3 s heartbeat thread, recovery fails only stale-heartbeat rows, conditional `job_fail_if_active` for recovery and cancel, `cancel_job` refuses another live process's job |
+| 7 | Lost wake-up when cancel landed before `_decision.clear()`; a second answer overwrote the first | **Confirmed** (unit test blocked the worker) | cancel re-checked after the clear; the answer slot is consumed once under a lock; a second `answer_job` is a `ToolError` |
+| 8 | Blocking JWKS HTTP inside async `verify_token`; unknown `kid` refetched every time | **Confirmed** | `anyio.to_thread.run_sync(decode)`; unknown kids negative-cached for 30 s |
+| 9 | `on_usage` serialised the live dict from worker threads; failures swallowed | **Confirmed** | deep copy taken under the ledger lock; persistence failures logged with traceback |
+| 10 | Pre-stage estimate compared with the total ceiling, not `limit - spent`; stage models from server settings instead of the pipeline `Config` | **Confirmed** | compare with the remainder (message quotes spent/remaining); operator mode takes `gate_model`/`dedup_model`/`synthesis_model` from `Config` |
+| 11 | Per-job psycopg connection never closed; expired rows never purged | **Confirmed** | `StageSet.close()` called in the runner's `finally`; `jobs_purge_expired` at startup |
+| 12 | Test tautology, either/or assertions, vacuous negative test, "one-to-one" wording, `ttl_s` null, mixed clocks in use-case 2 | **Confirmed** | real window assertion; event-gated deterministic tests for cancel and approve; positive control in the notification test; "maps directly" + the budget form described as our own elicitation shape; `ttl_s` reports the TTL that will apply; use cases 2–3 captured on a fresh copy |
+
+Related honesty notes: the heartbeat makes multi-process recovery safe, but jobs still run in
+one process and `active_for_run` is still a per-database read-then-insert without a lock, so
+two server replicas remain unsupported (README says so).
