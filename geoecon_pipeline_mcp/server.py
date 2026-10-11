@@ -30,6 +30,7 @@ Design choices, stated once here and once in the README:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -319,6 +320,8 @@ def create_server(settings: Settings | None = None, store: Store | None = None,
         store = _open_store(settings, tmp_ref)
     app = App(settings, store, stage_factory, llm_factory)
     app._tmp_db = tmp_ref[0] if tmp_ref else None
+    if app._tmp_db is not None:
+        atexit.register(app.close)        # remove the private synthetic copy when the process ends
     register_tools(app)
     register_resources(app)
     register_prompts(app)
@@ -815,10 +818,15 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     app = create_server()
-    if args.http:
-        app.mcp.run("streamable-http", host=args.host, port=args.port, stateless_http=True)
-    else:
-        app.mcp.run("stdio")
+    try:
+        if args.http:
+            app.mcp.run("streamable-http", host=args.host, port=args.port, stateless_http=True)
+        else:
+            app.mcp.run("stdio")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
 
 
 if __name__ == "__main__":
