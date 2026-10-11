@@ -85,7 +85,9 @@ async def test_stateless_http_serves_the_same_tools(http_app):
         assert [r["run_id"] for r in runs] == [105, 104]
         h = await call(client, "start_job", kind="run_stage", run_id=105, stage="render", force=True)
         job = await poll(client, h["job_id"])
-        assert job["status"] == "completed" and job["principal"] == "stdio"
+        # no verifier configured and bound to loopback: the dev case; callers are "local" and get
+        # STDIO_SCOPES. main() refuses this combination on a non-loopback host (tests/test_auth.py).
+        assert job["status"] == "completed" and job["principal"] == "local"
 
 
 @pytest.mark.anyio

@@ -182,6 +182,7 @@ class App:
         self.store = store
         self.bus = InMemorySubscriptionBus()
         verifier, auth = _auth_from(settings)
+        self.auth_enabled = verifier is not None
         self.mcp: MCPServer = MCPServer(
             "geoecon-pipeline", instructions=INSTRUCTIONS, subscriptions=self.bus,
             cache_hints={"resources/read": CacheHint(ttl_ms=0, scope="private")},
@@ -241,15 +242,20 @@ class App:
     # -- authorization -----------------------------------------------------------------
 
     def scopes(self) -> set[str]:
+        """Scopes of the caller. With a bearer token: the token's. Without one: STDIO_SCOPES, and
+        only when this server has no verifier at all (stdio, or loopback HTTP without auth). Once
+        auth is configured a missing token never falls back to anything."""
         token = get_access_token()
         if token is not None:
             return set(token.scopes)
+        if self.auth_enabled:
+            return set()
         return set(self.settings.stdio_scopes)
 
     def principal(self) -> str | None:
         token = get_access_token()
         if token is None:
-            return "stdio"
+            return "local"            # unauthenticated: stdio, or loopback HTTP with no verifier
         return token.subject or token.client_id
 
     def require(self, scope: str) -> None:
@@ -276,11 +282,24 @@ class App:
                     p.unlink()
 
 
+AUTH_FIELDS = ("auth_issuer", "auth_resource_url", "auth_jwks_url", "auth_hs256_secret", "auth_public_key_pem")
+
+
+def auth_configured(settings: Settings) -> bool:
+    return any(getattr(settings, f) for f in AUTH_FIELDS)
+
+
 def _auth_from(settings: Settings):
-    """OAuth resource-server wiring when an issuer and a resource URL are configured (HTTP mode).
-    Over stdio nothing is configured and STDIO_SCOPES apply."""
-    if not (settings.auth_issuer and settings.auth_resource_url):
+    """OAuth resource-server wiring. All-or-nothing: a partial AUTH_* configuration (a typo, a
+    missing key source) is a startup error, never a silently unauthenticated server."""
+    if not auth_configured(settings):
         return None, None
+    missing = [name for name, val in (("AUTH_ISSUER", settings.auth_issuer), ("AUTH_RESOURCE_URL", settings.auth_resource_url)) if not val]
+    if missing:
+        raise ValueError(f"partial auth configuration: {', '.join(missing)} missing while other AUTH_* settings are set")
+    if not (settings.auth_jwks_url or settings.auth_hs256_secret or settings.auth_public_key_pem):
+        raise ValueError("partial auth configuration: AUTH_ISSUER/AUTH_RESOURCE_URL set but no key source "
+                         "(AUTH_JWKS_URL, AUTH_PUBLIC_KEY_PEM or AUTH_HS256_SECRET)")
     from .auth import JwtVerifier
 
     verifier = JwtVerifier(issuer=settings.auth_issuer, audience=settings.auth_resource_url,
@@ -825,6 +844,10 @@ def register_prompts(app: App) -> None:
 # ── entry points ───────────────────────────────────────────────────────────────────
 
 
+def _is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+
+
 def __getattr__(name: str):
     """`mcp dev geoecon_pipeline_mcp/server.py` looks for a module attribute named `mcp`.
     Build it lazily so importing this module (tests) never opens a database."""
@@ -842,9 +865,15 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--http", action="store_true", help="serve Streamable HTTP")
     p.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    p.add_argument("--insecure-no-auth", action="store_true",
+                   help="serve HTTP on a non-loopback host without OAuth (every caller gets STDIO_SCOPES)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    app = create_server()
+    settings = Settings.from_env()
+    if args.http and not auth_configured(settings) and not _is_loopback(args.host) and not args.insecure_no_auth:
+        p.exit(2, f"refusing to serve HTTP on {args.host} without authentication: set AUTH_ISSUER, AUTH_RESOURCE_URL "
+                  f"and a key source, bind to 127.0.0.1, or pass --insecure-no-auth deliberately.\n")
+    app = create_server(settings)
     try:
         if args.http:
             app.mcp.run("streamable-http", host=args.host, port=args.port, stateless_http=True)

@@ -68,3 +68,51 @@ def test_server_builds_auth_settings_when_configured(synthetic_db):
         assert app.mcp.settings.auth.validate_token_resource is True
     finally:
         app.close()
+
+
+# ── fail closed (finding 4) ─────────────────────────────────────────────────────────────
+
+
+def test_partial_auth_configuration_is_a_startup_error(synthetic_db):
+    from geoecon_pipeline_mcp.server import Settings, create_server
+
+    for partial in ({"auth_issuer": ISS}, {"auth_resource_url": AUD}, {"auth_hs256_secret": SECRET},
+                    {"auth_issuer": ISS, "auth_resource_url": AUD}):             # no key source
+        with pytest.raises(ValueError, match="AUTH_"):
+            create_server(Settings(mode="synthetic", synthetic_db=synthetic_db, **partial))
+
+
+@pytest.mark.anyio
+async def test_no_token_never_inherits_stdio_scopes_when_auth_is_configured(synthetic_db):
+    from mcp import Client
+    from geoecon_pipeline_mcp.server import Settings, create_server
+
+    app = create_server(Settings(mode="synthetic", synthetic_db=synthetic_db, auth_issuer=ISS, auth_resource_url=AUD,
+                                 auth_hs256_secret=SECRET, stdio_scopes=("pipeline:read", "pipeline:operate")))
+    try:
+        async with Client(app.mcp, raise_exceptions=True) as client:        # in-process: no bearer middleware ran
+            r = await client.call_tool("list_runs", {})
+            assert r.is_error is True and "pipeline:read" in r.content[0].text
+            r = await client.call_tool("start_job", {"kind": "reconcile_abandoned"})
+            assert r.is_error is True and "pipeline:operate" in r.content[0].text
+    finally:
+        app.close()
+
+
+def test_http_on_a_non_loopback_host_without_auth_is_refused(monkeypatch):
+    from geoecon_pipeline_mcp import server as S
+
+    monkeypatch.setenv("GEOECON_MODE", "synthetic")
+    for var in ("AUTH_ISSUER", "AUTH_RESOURCE_URL", "AUTH_JWKS_URL", "AUTH_HS256_SECRET", "AUTH_PUBLIC_KEY_PEM"):
+        monkeypatch.delenv(var, raising=False)
+    created = []
+    monkeypatch.setattr(S, "create_server", lambda *a, **k: created.append(1) or (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(SystemExit) as ei:
+        S.main(["--http", "--host", "0.0.0.0"])
+    assert ei.value.code != 0 and created == []                                 # refused before anything was opened
+    with pytest.raises(RuntimeError, match="stop"):
+        S.main(["--http", "--host", "0.0.0.0", "--insecure-no-auth"])          # explicit opt-out reaches startup
+    with pytest.raises(RuntimeError, match="stop"):
+        S.main(["--http", "--host", "127.0.0.1"])                               # loopback dev is allowed
+    with pytest.raises(RuntimeError, match="stop"):
+        S.main(["--stdio"])
