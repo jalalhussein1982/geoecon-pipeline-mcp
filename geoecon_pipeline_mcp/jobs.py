@@ -226,6 +226,7 @@ class JobRunner(threading.Thread):
         self.stages = list(job["stages_planned"])
         self.budget = C.Budget(limit_usd=job["budget_usd"])
         self.cancel = threading.Event()
+        self.aborted = threading.Event()      # sticky: once the operator aborts, every later LLM call raises
         self._decision = threading.Event()
         self._answer: tuple[bool, float | None] | None = None
         self.result: dict[str, Any] = {}
@@ -269,6 +270,8 @@ class JobRunner(threading.Thread):
 
     def _ask_budget(self, message: str, est_usd: float) -> None:
         """Block the worker until answer_job or cancel_job. Raises BudgetAborted / JobCancelled."""
+        if self.aborted.is_set():
+            raise BudgetAborted("aborted at budget gate")
         req = {"key": "budget", "message": message, "requested_schema": BUDGET_SCHEMA}
         self._decision.clear()
         self._answer = None
@@ -279,6 +282,10 @@ class JobRunner(threading.Thread):
         approve, new_budget = self._answer or (False, None)
         self._update(input_response={"approve": approve, "new_budget_usd": new_budget})
         if not approve:
+            # Sticky. The upstream gate/synth stages fan LLM calls over a ThreadPoolExecutor inside a
+            # `with` block: the first BudgetAborted leaves the block via shutdown(wait=True), and the
+            # queued batches still call complete(); they must fail fast, not ask the operator again.
+            self.aborted.set()
             raise BudgetAborted("aborted at budget gate")
         new_limit = new_budget if new_budget is not None else max(self.budget.limit_usd, est_usd)
         if new_limit < est_usd:
@@ -315,7 +322,7 @@ class JobRunner(threading.Thread):
             inner = self.reg.llm_factory()
             client = C.CountingLLMClient(inner, self.reg.pricing, self.budget, self.usage,
                                          on_exceeded=self._on_budget_exceeded, cancel=self.cancel,
-                                         on_usage=lambda: self._update(usage=self.usage))
+                                         aborted=self.aborted, on_usage=lambda: self._update(usage=self.usage))
             fns = self.reg.stage_factory(client)
             counter = LogCounter(self._report, threading.get_ident())
             db_counter = None

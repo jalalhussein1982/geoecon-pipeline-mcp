@@ -114,13 +114,14 @@ class CountingLLMClient:
 
     def __init__(self, inner: Any, pricing: Pricing, budget: Budget, usage: dict[str, Any], *,
                  on_exceeded: Callable[[float], None] | None = None, cancel: threading.Event | None = None,
-                 on_usage: Callable[[], None] | None = None):
+                 aborted: threading.Event | None = None, on_usage: Callable[[], None] | None = None):
         self.inner = inner
         self.pricing = pricing
         self.budget = budget
         self.usage = usage
         self.on_exceeded = on_exceeded
         self.cancel = cancel
+        self.aborted = aborted
         self.on_usage = on_usage
         self.stage = "unknown"
         self.calls = 0
@@ -143,6 +144,9 @@ class CountingLLMClient:
         """Cooperation point: cancel wins; then the budget ceiling. Serialised so that four
         workers do not ask the operator four times."""
         with self._gate_lock:
+            if self.aborted is not None and self.aborted.is_set():
+                from .jobs import BudgetAborted
+                raise BudgetAborted("aborted at budget gate")
             if self.cancel is not None and self.cancel.is_set():
                 from .jobs import JobCancelled
                 raise JobCancelled("cancelled via MCP")

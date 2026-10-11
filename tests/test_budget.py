@@ -149,3 +149,79 @@ async def test_answer_after_cancel_is_refused_and_nothing_resumes(client, app):
     gate = next(s for s in app.store.run_detail(103)["stages"] if s["stage_name"] == "gate")
     assert gate["status"] == "failed" and "NullGateError" in gate["error"]      # untouched: the stage never started
     assert (await call(client, "job_status", job_id=h["job_id"]))["status"] == "cancelled"
+
+
+# ── fan-out: the upstream gate/synth stages run LLM calls in a ThreadPoolExecutor ───────
+
+
+class _PromptCountingStore:
+    """Wrap a SyntheticStore so the test can count how often a job was parked in input_required."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.prompts = 0
+
+    def job_update(self, job_id, **fields):
+        if fields.get("status") == "input_required":
+            self.prompts += 1
+        return self._inner.job_update(job_id, **fields)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _fanout_registry(store, n_calls=10, workers=4):
+    """A stage that mirrors gate.run: LLM calls fan out over a `with ThreadPoolExecutor` block
+    and the main thread collects `fut.result()`; the first raise leaves the block via
+    shutdown(wait=True), so queued batches still call complete()."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def factory(client):
+        def gate(run, report, cancel):
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(client.complete, "deepseek-v3.2", [{"role": "user", "content": "x"}]) for _ in range(n_calls)]
+                for fut in as_completed(futs):
+                    fut.result()
+            return {"gate_total": n_calls}
+        return {"gate": gate}
+
+    from geoecon_pipeline_mcp.jobs import JobRegistry
+    return JobRegistry(store, factory, pricing=PRICING, stage_models={"gate": "deepseek-v3.2"},
+                       llm_factory=lambda: FakeLLM(300_000, 60_000, latency_s=0.01))
+
+
+def _wait_status(reg, job_id, statuses, timeout=5.0):
+    import time
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        row = reg.get(job_id)
+        if row["status"] in statuses:
+            return row
+        time.sleep(0.01)
+    raise AssertionError(f"job did not reach {statuses}: {reg.get(job_id)}")
+
+
+def test_budget_abort_under_fanout_prompts_exactly_once(store):
+    spy = _PromptCountingStore(store)
+    reg = _fanout_registry(spy)
+    job = reg.start("run_stage", 103, ["gate"], 0.2, "test", {})          # estimate 0.024 fits; real calls do not
+    _wait_status(reg, job["job_id"], ("input_required",))
+    reg.answer(job["job_id"], False, None)
+    row = _wait_status(reg, job["job_id"], ("failed", "completed", "cancelled"))
+    assert row["status"] == "failed" and row["error"] == "aborted at budget gate"
+    assert spy.prompts == 1, f"the operator was asked {spy.prompts} times"
+    gate = next(s for s in store.run_detail(103)["stages"] if s["stage_name"] == "gate")
+    assert gate["status"] == "failed" and gate["error"] == "aborted at budget gate"
+    reg.shutdown()
+
+
+def test_budget_approve_under_fanout_asks_once_per_overspend_not_per_worker(store):
+    spy = _PromptCountingStore(store)
+    reg = _fanout_registry(spy)
+    job = reg.start("run_stage", 103, ["gate"], 0.2, "test", {})
+    _wait_status(reg, job["job_id"], ("input_required",))
+    reg.answer(job["job_id"], True, 100.0)
+    row = _wait_status(reg, job["job_id"], ("failed", "completed", "cancelled"))
+    assert row["status"] == "completed" and row["result"]["gate"]["gate_total"] == 10
+    assert spy.prompts == 1
+    reg.shutdown()
